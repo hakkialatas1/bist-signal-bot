@@ -510,6 +510,10 @@ def main():
     today_df["w_final"] = pd.to_numeric(today_df["w_scaled"], errors="coerce").fillna(0.0)
     today_df = today_df[today_df["w_final"] > 0].copy()
     today_df = today_df.sort_values("w_final", ascending=False)
+    today_df = today_df.head(TOP_N).copy()
+    MIN_PRINT_PCT = 0.20  # %0.20 altını gösterme
+    today_df = today_df[today_df["w_final"] * 100 >= MIN_PRINT_PCT].copy()
+
     today_df["alloc_TL"] = (today_df["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
     today_df["weight_%"] = (today_df["w_final"] * 100).round(3)
 
