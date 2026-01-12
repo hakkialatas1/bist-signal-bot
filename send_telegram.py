@@ -40,7 +40,7 @@ buy  = buy[buy["target_weight_%"] >= MIN_PRINT_PCT].head(TOP_N)
 hold = hold[hold["target_weight_%"] >= MIN_PRINT_PCT].head(TOP_N)
 
 # SAT zaten liste dışı olduğu için filtre gerekmiyor (istersen ilk 20 ile sınırlayabiliriz)
-sell = sell.head(30)
+sell = sell.head(15)
 
 lines = []
 lines.append(f"📈 BIST100 SİNYAL (TOP{TOP_N})")
