@@ -1,0 +1,32 @@
+name: Daily Signal
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 15 * * 1-5"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run signal
+        run: |
+          python algo_step2_LIVE_TOP15.py
+
+      - name: Send to Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python send_telegram.py
