@@ -528,6 +528,9 @@ def main():
     prev_set  = set(prev_df["ticker"].tolist())
 
     to_buy  = today_set - prev_set
+    MIN_TRADE_PCT = 0.20  # %0.20 altını yok say
+    prev_df["w_prev_pct"] = pd.to_numeric(prev_df["w_prev"], errors="coerce").fillna(0.0) * 100
+    prev_df = prev_df[prev_df["w_prev_pct"] >= MIN_TRADE_PCT].copy()
     to_sell = prev_set - today_set
 
     orders = []
