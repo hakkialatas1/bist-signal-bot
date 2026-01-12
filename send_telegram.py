@@ -23,6 +23,14 @@ date = str(orders["date"].iloc[0])
 buy  = orders[orders["side"] == "AL"].copy()
 hold = orders[orders["side"] == "TUT"].copy()
 sell = orders[orders["side"] == "SAT"].copy()
+TOP_N = 15
+buy = buy.sort_values("target_weight_%", ascending=False).head(TOP_N)
+hold = hold.sort_values("target_weight_%", ascending=False).head(TOP_N)
+
+# 0 veya çok küçükleri filtrele (güzel görünmesi için)
+MIN_PRINT_PCT = 0.20
+buy = buy[buy["target_weight_%"] >= MIN_PRINT_PCT]
+hold = hold[hold["target_weight_%"] >= MIN_PRINT_PCT]
 
 # Sırala + filtrele + ilk TOP_N
 buy  = buy.sort_values("target_weight_%", ascending=False)
