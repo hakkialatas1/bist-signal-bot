@@ -114,7 +114,12 @@ def last_date_from_raw(raw: pd.DataFrame) -> Optional[pd.Timestamp]:
 # =========================
 def write_no_trade_outputs(reason: str, data_date: Optional[pd.Timestamp] = None) -> None:
     t0 = today_tr()
-    dd = (data_date.normalize() if isinstance(data_date, pd.Timestamp) else t0)
+
+    # ✅ Veri yoksa data_date "unknown" olsun (bugün yazmasın)
+    if isinstance(data_date, pd.Timestamp):
+        dd_str = str(pd.to_datetime(data_date).normalize().date())
+    else:
+        dd_str = "unknown"
 
     orders_df = pd.DataFrame([{
         "date": str(t0.date()),
@@ -123,7 +128,7 @@ def write_no_trade_outputs(reason: str, data_date: Optional[pd.Timestamp] = None
         "target_weight_%": 0.0,
         "target_alloc_TL": 0,
         "note": reason,
-        "data_date": str(dd.date()),
+        "data_date": dd_str,
         "fresh": 0,
         "fresh_note": f"⛔ {reason} → BUGÜN İŞLEM YOK"
     }])
@@ -132,19 +137,20 @@ def write_no_trade_outputs(reason: str, data_date: Optional[pd.Timestamp] = None
     with open("orders_today.txt", "w", encoding="utf-8") as f:
         f.write(reason + "\n")
 
-    # empty-but-valid files so workflow stays green
-    pd.DataFrame({"date":[t0], "equity_scaled":[1.0]}).to_csv("equity_curve_live.csv", index=False)
+    # Workflow yeşil kalsın diye boş/valid dosyalar
+    pd.DataFrame({"date": [t0], "equity_scaled": [1.0]}).to_csv("equity_curve_live.csv", index=False)
     pd.DataFrame([{
-        "variant":"NO_TRADE",
-        "return_%":0.0,
-        "sharpe":0.0,
-        "maxDD_%":0.0,
-        "days":0
+        "variant": "NO_TRADE",
+        "return_%": 0.0,
+        "sharpe": 0.0,
+        "maxDD_%": 0.0,
+        "days": 0
     }]).to_csv("report_live.csv", index=False)
 
-    pd.DataFrame(columns=["date","ticker","weight_%","alloc_TL"]).to_csv("live_signal_today.csv", index=False)
+    pd.DataFrame(columns=["date", "ticker", "weight_%", "alloc_TL"]).to_csv("live_signal_today.csv", index=False)
 
     safe_print("✅ Fallback dosyaları üretildi (no-trade).")
+
 
 
 # =========================
