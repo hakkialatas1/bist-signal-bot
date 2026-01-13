@@ -1,11 +1,14 @@
 # algo_step2_LIVE_TOP15.py
 # STEP-2 LIVE signal generator + AL/TUT/SAT orders (BIST100 TOP15)
-# Uses FINAL-FIXED logic: aggregate pnl, rebuild equity; generate last-day signal
+# Robust Yahoo downloader (chunk+retry), freshness tagging, cooldown, and safe fallback (no-trade)
 
 import warnings
 warnings.filterwarnings("ignore")
 
 import datetime as dt
+import time
+import random
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -39,7 +42,7 @@ TRAIN_DAYS = 252 * 3
 TEST_DAYS  = 63
 STEP_DAYS  = 63
 
-TOP_N = 15                 # ✅ grid winner
+TOP_N = 15
 POS_CAP = 0.08
 GROSS_CAP = 1.00
 LAMBDA_VOL = 0.35
@@ -63,19 +66,83 @@ MARKET_CANDIDATES = ["XU100.IS", "^XU100"]
 
 
 # =========================
+# ROBUST DOWNLOAD (chunk + retry)
+# =========================
+def yf_download(tickers, start, end, chunk_size=10, max_retries=6):
+    """
+    Yahoo rate-limit'e takılmamak için tickers'ı parça parça indirir.
+    Rate limit olursa exponential backoff ile tekrar dener.
+    """
+    tickers = list(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
+    chunks = [tickers[i:i+chunk_size] for i in range(0, len(tickers), chunk_size)]
+    all_parts = []
+
+    for ci, ch in enumerate(chunks, start=1):
+        # jitter
+        time.sleep(1.0 + random.random() * 1.0)
+
+        ok = False
+        last_err = None
+
+        for r in range(max_retries):
+            try:
+                df = yf.download(
+                    tickers=ch,
+                    start=start,
+                    end=end,
+                    auto_adjust=False,
+                    group_by="column",
+                    threads=False,     # ✅ rate limit için daha güvenli
+                    progress=False
+                )
+                if df is not None and not df.empty:
+                    all_parts.append(df)
+                    ok = True
+                    break
+                last_err = "empty"
+            except Exception as e:
+                last_err = str(e)
+
+            wait = min(120, (2 ** r)) + random.random() * 3.0
+            print(f"⚠️ chunk {ci}/{len(chunks)} retry {r+1}/{max_retries} (wait {wait:.1f}s) err={last_err}")
+            time.sleep(wait)
+
+        if not ok:
+            print(f"❌ chunk {ci}/{len(chunks)} indirilemedi. err={last_err}")
+
+    if not all_parts:
+        return pd.DataFrame()
+
+    # concat axis=1 to merge multiindex columns
+    try:
+        raw = pd.concat(all_parts, axis=1)
+    except Exception:
+        raw = all_parts[0]
+        for p in all_parts[1:]:
+            try:
+                raw = raw.join(p, how="outer")
+            except Exception:
+                raw = pd.concat([raw, p], axis=1)
+    return raw
+
+
+def last_date_from_raw(raw: pd.DataFrame):
+    try:
+        if raw is None or raw.empty:
+            return None
+        idx = raw.index
+        s = pd.to_datetime(pd.Index(idx), errors="coerce").dropna()
+        return s.max().normalize() if len(s) else None
+    except Exception:
+        return None
+
+
+# =========================
 # DATA helpers
 # =========================
-def yf_download(tickers, start, end):
-    return yf.download(
-        tickers=tickers,
-        start=start,
-        end=end,
-        auto_adjust=False,
-        group_by="column",
-        threads=True,
-        progress=True,
-    )
-
 def _normalize_ohlcv(df: pd.DataFrame, ticker: str):
     if df is None or df.empty:
         return None
@@ -111,7 +178,10 @@ def _normalize_ohlcv(df: pd.DataFrame, ticker: str):
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     return df[["date","ticker","open","high","low","close","volume"]]
 
+
 def extract_one_ticker(raw: pd.DataFrame, ticker: str):
+    if raw is None or raw.empty:
+        return None
     if isinstance(raw.columns, pd.MultiIndex):
         for level in [1, 0]:
             try:
@@ -124,6 +194,7 @@ def extract_one_ticker(raw: pd.DataFrame, ticker: str):
         return None
     return _normalize_ohlcv(raw.copy(), ticker)
 
+
 def build_panel(raw: pd.DataFrame, tickers):
     frames = []
     for t in tickers:
@@ -135,10 +206,11 @@ def build_panel(raw: pd.DataFrame, tickers):
     panel = pd.concat(frames, ignore_index=True)
     return panel.sort_values(["ticker", "date"]).reset_index(drop=True)
 
+
 def load_market_series(start: str, end):
     for sym in MARKET_CANDIDATES:
         try:
-            df = yf.download(sym, start=start, end=end, auto_adjust=False, progress=False)
+            df = yf.download(sym, start=start, end=end, auto_adjust=False, progress=False, threads=False)
             if df is None or df.empty:
                 continue
             df = df.reset_index().rename(columns={df.reset_index().columns[0]: "date"})
@@ -160,22 +232,6 @@ def load_market_series(start: str, end):
     return None
 
 
-def last_date_from_raw(raw: pd.DataFrame):
-    """Raw download içinden en son tarihi bulmaya çalışır (hızlı freshness kontrol)."""
-    try:
-        if isinstance(raw.columns, pd.MultiIndex):
-            # any column -> take index
-            idx = raw.index
-        else:
-            idx = raw.index
-        if idx is None or len(idx) == 0:
-            return None
-        s = pd.to_datetime(pd.Index(idx), errors="coerce").dropna()
-        return s.max().normalize() if len(s) else None
-    except Exception:
-        return None
-
-
 # =========================
 # FEATURES
 # =========================
@@ -185,6 +241,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     down = (-delta.clip(upper=0)).rolling(period).mean()
     rs = up / (down + 1e-12)
     return 100 - (100 / (1 + rs))
+
 
 def add_features(panel: pd.DataFrame, mkt):
     out = panel.copy()
@@ -231,8 +288,10 @@ def add_features(panel: pd.DataFrame, mkt):
         mdf["mkt_ret_5"]  = np.log(mdf["mkt_close"] / mdf["mkt_close"].shift(5))
         mdf["mkt_ret_20"] = np.log(mdf["mkt_close"] / mdf["mkt_close"].shift(20))
         mdf["trend_flag"] = (mdf["mkt_close"].rolling(50).mean() > mdf["mkt_close"].rolling(200).mean()).astype(int)
-        out = out.merge(mdf[["date","mkt_ret_1","mkt_ret_5","mkt_ret_20","trend_flag"]],
-                        on="date", how="left")
+        out = out.merge(
+            mdf[["date","mkt_ret_1","mkt_ret_5","mkt_ret_20","trend_flag"]],
+            on="date", how="left"
+        )
     else:
         uni = out.groupby("date")["ret_1"].mean().rename("mkt_ret_1").to_frame()
         uni["mkt_ret_5"]  = uni["mkt_ret_1"].rolling(5).sum()
@@ -258,6 +317,7 @@ def add_features(panel: pd.DataFrame, mkt):
     out = out.sort_values(["ticker","date"]).reset_index(drop=True)
     out["beta_60"] = out.groupby("ticker", group_keys=False).apply(rolling_beta)
     return out
+
 
 FEATURES = [
     "ret_1","ret_2","ret_5","ret_10","ret_20",
@@ -285,6 +345,7 @@ def walk_forward_dates(dates: np.ndarray, train_days: int, test_days: int, step_
         yield dates[i:tr_end], dates[tr_end:te_end]
         i += step_days
 
+
 def compute_vol_thr_from_context(context_df: pd.DataFrame, vol_q: float) -> pd.Series:
     ctx = context_df.copy()
     ctx["date"] = pd.to_datetime(ctx["date"], errors="coerce").dt.normalize()
@@ -295,11 +356,13 @@ def compute_vol_thr_from_context(context_df: pd.DataFrame, vol_q: float) -> pd.S
     thr.name = "vol_thr"
     return thr
 
+
 def portfolio_vol_target_scale(daily_pnl: pd.Series, target_annual: float, lookback: int) -> pd.Series:
     target_daily = target_annual / np.sqrt(252)
     vol = daily_pnl.rolling(lookback, min_periods=max(20, lookback//3)).std()
     scale = (target_daily / (vol + 1e-12)).clip(upper=3.0)
     return scale.shift(1).fillna(1.0)
+
 
 def ema_by_ticker(df: pd.DataFrame, col: str, alpha: float) -> pd.Series:
     out = np.empty(len(df), dtype=float)
@@ -385,9 +448,37 @@ def sharpe(x: pd.Series) -> float:
     r = x.to_numpy(float)
     return float((r.mean() / (r.std() + 1e-12)) * np.sqrt(252))
 
+
 def max_dd(eq: pd.Series) -> float:
     peak = eq.cummax()
     return float((eq / peak - 1.0).min())
+
+
+# =========================
+# SAFE FALLBACK OUTPUTS
+# =========================
+def write_no_trade_outputs(reason: str):
+    today_local = pd.Timestamp(dt.date.today()).normalize()
+    orders_df = pd.DataFrame([{
+        "date": str(today_local.date()),
+        "side": "TUT",
+        "ticker": "N/A",
+        "target_weight_%": 0.0,
+        "target_alloc_TL": 0,
+        "note": reason,
+        "data_date": str(today_local.date()),
+        "fresh": 0,
+        "fresh_note": f"⚠️ {reason} → BUGÜN İŞLEM YOK"
+    }])
+    orders_df.to_csv("orders_today.csv", index=False)
+    with open("orders_today.txt", "w", encoding="utf-8") as f:
+        f.write(reason + "\n")
+
+    pd.DataFrame({"date":[today_local], "equity_scaled":[1.0]}).to_csv("equity_curve_live.csv", index=False)
+    pd.DataFrame([{"variant":"NO_TRADE","return_%":0.0,"sharpe":0.0,"maxDD_%":0.0,"days":0}]).to_csv("report_live.csv", index=False)
+    pd.DataFrame(columns=["date","ticker","weight_%","alloc_TL"]).to_csv("live_signal_today.csv", index=False)
+
+    print("✅ Fallback dosyaları üretildi (no-trade).")
 
 
 # =========================
@@ -395,22 +486,17 @@ def max_dd(eq: pd.Series) -> float:
 # =========================
 def main():
     print("1) Download BIST100 (Yahoo)...")
+    raw = yf_download(TICKERS_ALL, START, END, chunk_size=10, max_retries=6)
 
-    raw = yf_download(TICKERS_ALL, START, END)
+    if raw is None or raw.empty:
+        write_no_trade_outputs("VERİ YOK (YF rate limit / erişim)")
+        return
 
-    # Retry if data looks stale (Yahoo can lag)
     today_local = pd.Timestamp(dt.date.today()).normalize()
     raw_last = last_date_from_raw(raw)
-
-    for attempt in [1, 2]:
-        if raw_last is None:
-            break
-        age = int((today_local - raw_last).days)
-        if age <= 1:
-            break
-        print(f"⚠️ Yahoo verisi eski görünüyor (son: {raw_last.date()}, age={age} gün). Retry {attempt}/2 ...")
-        raw = yf_download(TICKERS_ALL, START, END)
-        raw_last = last_date_from_raw(raw)
+    if raw_last is None:
+        write_no_trade_outputs("VERİ OKUNAMADI (raw_last None)")
+        return
 
     # Drop missing tickers
     if isinstance(raw.columns, pd.MultiIndex):
@@ -418,14 +504,19 @@ def main():
         tickers_ok = [t for t in TICKERS_ALL if t in got]
         missing = [t for t in TICKERS_ALL if t not in got]
         if missing:
-            print(f"Uyarı: {len(missing)} ticker yok (çıkarıldı). Örn: {missing[:10]}")
+            print(f"Uyarı: {len(missing)} ticker yok/eksik (çıkarıldı). Örn: {missing[:10]}")
     else:
         tickers_ok = TICKERS_ALL
 
     mkt = load_market_series(START, END)
 
     print("2) Panel + features...")
-    panel = build_panel(raw, tickers_ok)
+    try:
+        panel = build_panel(raw, tickers_ok)
+    except Exception as e:
+        write_no_trade_outputs(f"VERİ HAZIRLANAMADI ({type(e).__name__})")
+        return
+
     panel = add_features(panel, mkt)
 
     need = ["date","ticker","ret_1","vol_20","dv20","y_fwd"] + FEATURES
@@ -434,7 +525,8 @@ def main():
 
     dates = np.array(sorted(panel["date"].unique()))
     if len(dates) < (TRAIN_DAYS + TEST_DAYS + 50):
-        raise ValueError(f"Yetersiz gün: {len(dates)}")
+        write_no_trade_outputs(f"YETERSİZ GÜN ({len(dates)})")
+        return
 
     print("3) Walk-forward + collect last signal...")
     trades_chunks = []
@@ -448,7 +540,6 @@ def main():
         if train.empty or test.empty:
             continue
 
-        # 80/20 split inside train for vol_q selection
         tr_dates = np.array(sorted(train["date"].unique()))
         split = int(len(tr_dates) * 0.8)
         trd, vad = tr_dates[:split], tr_dates[split:]
@@ -466,7 +557,6 @@ def main():
         va_pred = va_df[["date","ticker","ret_1","vol_20","dv20"]].copy()
         va_pred["mu_hat"] = model.predict(va_df[FEATURES])
 
-        # choose vol_q
         best = (-1e9, None)
         for vol_q in VOL_Q_GRID:
             thr_va = compute_vol_thr_from_context(
@@ -478,8 +568,9 @@ def main():
             if s > best[0]:
                 best = (s, vol_q)
         vol_q_best = best[1]
+        if vol_q_best is None:
+            continue
 
-        # refit on full train
         model.fit(train[FEATURES], train["y_fwd"].astype(float))
 
         te_pred = test[["date","ticker","ret_1","vol_20","dv20"]].copy()
@@ -495,9 +586,12 @@ def main():
         trades_chunks.append(bt)
         daily_chunks.append(d)
 
+    if not trades_chunks or not daily_chunks:
+        write_no_trade_outputs("MODEL SONUÇ ÜRETEMEDİ")
+        return
+
     trades = pd.concat(trades_chunks, ignore_index=True)
 
-    # Aggregate daily pnl correctly, then rebuild equity
     all_daily = pd.concat(daily_chunks)
     all_daily = all_daily.reset_index().rename(columns={"index":"date"}) if "date" not in all_daily.columns else all_daily
     all_daily["date"] = pd.to_datetime(all_daily["date"], errors="coerce").dt.normalize()
@@ -505,7 +599,8 @@ def main():
     daily["equity"] = np.exp(daily["pnl"].cumsum())
     daily["equity_scaled"] = np.exp(daily["pnl_scaled"].cumsum())
 
-    daily.to_csv("equity_curve_live.csv")
+    daily.to_csv("equity_curve_live.csv", index=True)
+
     rep = pd.DataFrame([{
         "variant":"VOL_TARGET",
         "end_capital_TL": INIT_CAPITAL_TL * float(daily["equity_scaled"].iloc[-1]),
@@ -517,15 +612,15 @@ def main():
     }])
     rep.to_csv("report_live.csv", index=False)
 
-    # ===== LIVE SIGNAL (last available date) =====
+    # ===== LIVE SIGNAL =====
     last_date = trades["date"].dropna().max()
     if pd.isna(last_date):
-        raise ValueError("Sinyal üretilemedi: trades boş.")
+        write_no_trade_outputs("SİNYAL YOK (trades boş)")
+        return
 
-    # --- DATA FRESHNESS CHECK (for Telegram / kill-switch) ---
     last_norm = pd.to_datetime(last_date).normalize()
     data_age_days = int((today_local - last_norm).days)
-    data_is_fresh = (data_age_days <= 1)  # 0-1 gün fark: kabul
+    data_is_fresh = (data_age_days <= 1)
     freshness_note = "✅ GÜNCEL" if data_is_fresh else f"⚠️ GÜNCEL DEĞİL ({data_age_days} gün eski)"
 
     tdf = trades[trades["date"] == last_date].copy()
@@ -544,13 +639,12 @@ def main():
     prev_date = all_dates[-2] if len(all_dates) >= 2 else None
     today_date = all_dates[-1]
 
-    # --- BUGÜN: hedef portföy (TOP_N) ---
+    MIN_TRADE_PCT = 0.20
+
     today_df = trades[trades["date"] == today_date].copy()
     today_df["w_final"] = pd.to_numeric(today_df["w_scaled"], errors="coerce").fillna(0.0)
-    today_df = today_df[today_df["w_final"] > 0].copy()
-    today_df = today_df.sort_values("w_final", ascending=False)
+    today_df = today_df[today_df["w_final"] > 0].sort_values("w_final", ascending=False)
 
-    MIN_TRADE_PCT = 0.20  # %0.20 altını yok say
     today_top = today_df.head(TOP_N).copy()
     today_top = today_top[(today_top["w_final"] * 100) >= MIN_TRADE_PCT].copy()
 
@@ -558,12 +652,10 @@ def main():
     today_top["weight_%"] = (today_top["w_final"] * 100).round(3)
     today_set = set(today_top["ticker"].tolist())
 
-    # --- DÜN: sadece TOP_N üzerinden SAT hesapla ---
     if prev_date is not None:
         prev_df = trades[trades["date"] == prev_date].copy()
         prev_df["w_prev"] = pd.to_numeric(prev_df["w_scaled"], errors="coerce").fillna(0.0)
-        prev_df = prev_df[prev_df["w_prev"] > 0].copy()
-        prev_df = prev_df.sort_values("w_prev", ascending=False)
+        prev_df = prev_df[prev_df["w_prev"] > 0].sort_values("w_prev", ascending=False)
 
         prev_top = prev_df.head(TOP_N).copy()
         prev_top = prev_top[(prev_top["w_prev"] * 100) >= MIN_TRADE_PCT].copy()
@@ -574,11 +666,10 @@ def main():
     to_buy  = today_set - prev_set
     to_sell = prev_set - today_set
 
-    # --- COOLDOWN: SAT sonrası X gün tekrar AL yapma ---
+    # COOLDOWN
     COOLDOWN_DAYS = 5
-    recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]  # tampon
+    recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]
     top_sets = {}
-
     for d0 in recent_dates:
         df_d = trades[trades["date"] == d0].copy()
         df_d["w_d"] = pd.to_numeric(df_d["w_scaled"], errors="coerce").fillna(0.0)
@@ -587,16 +678,12 @@ def main():
 
     cooldown_block = set()
     for i in range(1, len(recent_dates)):
-        d_prev = recent_dates[i-1]
-        d_cur  = recent_dates[i]
-        exited = top_sets.get(d_prev, set()) - top_sets.get(d_cur, set())
+        exited = top_sets.get(recent_dates[i-1], set()) - top_sets.get(recent_dates[i], set())
         cooldown_block |= exited
 
     to_buy = {t for t in to_buy if t not in cooldown_block}
 
     orders = []
-
-    # AL / TUT
     for _, r in today_top.iterrows():
         t = r["ticker"]
         side = "AL" if t in to_buy else "TUT"
@@ -612,7 +699,6 @@ def main():
             "fresh_note": freshness_note
         })
 
-    # SAT
     for t in sorted(list(to_sell)):
         orders.append({
             "date": str(pd.to_datetime(today_date).date()),
@@ -626,8 +712,7 @@ def main():
             "fresh_note": freshness_note
         })
 
-    orders_df = pd.DataFrame(orders)
-    orders_df = orders_df.drop_duplicates(subset=["date", "side", "ticker"], keep="first").reset_index(drop=True)
+    orders_df = pd.DataFrame(orders).drop_duplicates(subset=["date","side","ticker"], keep="first").reset_index(drop=True)
     orders_df.to_csv("orders_today.csv", index=False)
 
     with open("orders_today.txt", "w", encoding="utf-8") as f:
@@ -644,8 +729,6 @@ def main():
     print(" - report_live.csv")
     print(f"\nSignal date: {pd.to_datetime(today_date).date()}")
     print(f"Data date: {last_norm.date()} | {freshness_note}")
-    print("\nİlk 10 emir:")
-    print(orders_df.head(10).to_string(index=False))
 
 
 if __name__ == "__main__":
