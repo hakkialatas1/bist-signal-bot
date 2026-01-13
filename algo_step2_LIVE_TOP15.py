@@ -2,11 +2,11 @@
 # STEP-2 LIVE signal generator (BIST100 TOPN) + Orders (AL/TUT/SAT)
 # Robust for GitHub Actions + Yahoo: chunk download + retry/backoff + safe no-trade fallback
 # Output files:
-#   - live_signal_today.csv
-#   - orders_today.csv (+ data_date/fresh/fresh_note)
-#   - orders_today.txt
-#   - equity_curve_live.csv
-#   - report_live.csv
+#   - live_signal_bist.csv
+#   - orders_bist.csv (+ data_date/fresh/fresh_note)
+#   - orders_bist.txt
+#   - equity_curve_bist.csv
+#   - report_bist.csv
 
 import warnings
 warnings.filterwarnings("ignore")
