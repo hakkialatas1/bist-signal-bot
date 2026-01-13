@@ -565,6 +565,7 @@ def main():
         })
 
     orders_df = pd.DataFrame(orders)
+    orders_df = orders_df.drop_duplicates(subset=["date", "side", "ticker"], keep="first").reset_index(drop=True)
     orders_df.to_csv("orders_today.csv", index=False)
 
     with open("orders_today.txt", "w", encoding="utf-8") as f:
