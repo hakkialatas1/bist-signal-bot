@@ -537,6 +537,32 @@ def main():
 
     to_buy  = today_set - prev_set
     to_sell = prev_set - today_set
+    # --- COOLDOWN: SAT sonrası X gün tekrar AL yapma ---
+    COOLDOWN_DAYS = 5
+    # trades içinde "SAT" bilgisini tutmuyoruz; bunu prev_set - today_set ile üretiyoruz.
+    # Bu yüzden cooldown için "orders_today.csv" yerine, geçmiş sinyal günlerinden bir "top-set" geçmişi çıkarıyoruz.
+    # Son N gün için top setleri hesaplayıp "çıkış" yakalayacağız
+    recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]  # biraz tampon
+    top_sets = {}
+
+    for d in recent_dates:
+        df_d = trades[trades["date"] == d].copy()
+        df_d["w_d"] = pd.to_numeric(df_d["w_scaled"], errors="coerce").fillna(0.0)
+        df_d = df_d[df_d["w_d"] > 0].sort_values("w_d", ascending=False).head(TOP_N)
+        top_sets[d] = set(df_d["ticker"].tolist())
+
+    # cooldown listesi: son COOLDOWN_DAYS içinde "top listeden çıkmış" hisseler
+    cooldown_block = set()
+    for i in range(1, len(recent_dates)):
+        d_prev = recent_dates[i-1]
+        d_cur  = recent_dates[i]
+        prev_set_i = top_sets.get(d_prev, set())
+        cur_set_i  = top_sets.get(d_cur, set())
+        exited = prev_set_i - cur_set_i
+        cooldown_block |= exited
+
+    # BUGÜN için AL listesinde olup cooldown'da olanları çıkar
+    to_buy = {t for t in to_buy if t not in cooldown_block}
 
     orders = []
 
