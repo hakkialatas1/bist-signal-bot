@@ -20,9 +20,17 @@ orders["target_weight_%"] = pd.to_numeric(orders.get("target_weight_%", 0), erro
 orders["target_alloc_TL"] = pd.to_numeric(orders.get("target_alloc_TL", 0), errors="coerce").fillna(0).astype(int)
 
 # Data freshness bilgisi (yoksa boş geç)
-data_date = str(orders["data_date"].iloc[0]) if "data_date" in orders.columns and len(orders) else "unknown"
-fresh_note = str(orders["fresh_note"].iloc[0]) if "fresh_note" in orders.columns and len(orders) else ""
-fresh = int(pd.to_numeric(orders["fresh"].iloc[0], errors="coerce")) if "fresh" in orders.columns and len(orders) else 0
+data_date = "unknown"
+fresh_note = ""
+fresh = 0
+
+if len(orders):
+    if "data_date" in orders.columns:
+        data_date = str(orders["data_date"].iloc[0])
+    if "fresh_note" in orders.columns:
+        fresh_note = str(orders["fresh_note"].iloc[0])
+    if "fresh" in orders.columns:
+        fresh = int(pd.to_numeric(orders["fresh"].iloc[0], errors="coerce") or 0)
 
 date = str(orders["date"].iloc[0]) if "date" in orders.columns and len(orders) else "unknown"
 
@@ -43,14 +51,17 @@ lines = []
 lines.append(f"📈 BIST100 SİNYAL (TOP{TOP_N})")
 lines.append(f"Sinyal: {date}")
 lines.append("Uygulama: T+1 açılış / ilk likit")
-lines.append(f"📅 Veri tarihi: {data_date}  {fresh_note}".strip())
+
+# Veri tarihi + not (fresh_note zaten kilit mesajı içerebilir)
+meta = f"📅 Veri tarihi: {data_date}"
+if fresh_note and fresh_note.strip():
+    meta = f"{meta}  {fresh_note.strip()}"
+lines.append(meta)
 lines.append("")
 
 # Kill-switch: veri güncel değilse emirleri basma
 if KILL_SWITCH_IF_NOT_FRESH and fresh == 0:
-    lines.append("⛔ Veri güncel değil → BUGÜN İŞLEM YOK (güvenlik kilidi)")
     msg = "\n".join(lines).strip()
-
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     resp = requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
     if resp.status_code != 200:
@@ -65,7 +76,8 @@ if len(buy):
         lines.append(f"• {r['ticker']}  %{float(r['target_weight_%']):.3f}  (~{int(r['target_alloc_TL'])} TL)")
     lines.append("")
 else:
-    lines.append("🟢 AL (yeni): Yok\n")
+    lines.append("🟢 AL (yeni): Yok")
+    lines.append("")
 
 if len(hold):
     lines.append("🟡 TUT (devam):")
@@ -73,7 +85,8 @@ if len(hold):
         lines.append(f"• {r['ticker']}  %{float(r['target_weight_%']):.3f}  (~{int(r['target_alloc_TL'])} TL)")
     lines.append("")
 else:
-    lines.append("🟡 TUT (devam): Yok\n")
+    lines.append("🟡 TUT (devam): Yok")
+    lines.append("")
 
 if len(sell):
     lines.append("🔴 SAT (çıkan):")
@@ -81,7 +94,8 @@ if len(sell):
         lines.append(f"• {r['ticker']}")
     lines.append("")
 else:
-    lines.append("🔴 SAT (çıkan): Yok\n")
+    lines.append("🔴 SAT (çıkan): Yok")
+    lines.append("")
 
 msg = "\n".join(lines).strip()
 
