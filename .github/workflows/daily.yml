@@ -20,19 +20,21 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-       - name: Run Signal (try 1)
-       run: python algo_step2_LIVE_TOP15.py || true
+      - name: Run algo (try 1)
+        run: python algo_step2_LIVE_TOP15.py || true
 
-       - name: Wait 2 minutes (rate-limit backoff)
+      - name: Wait 2 minutes (rate-limit backoff)
         run: sleep 120
 
-- name: Run algo (try 2)
-  run: python algo_step2_LIVE_TOP15.py
+      - name: Run algo (try 2)
+        run: python algo_step2_LIVE_TOP15.py
 
 
-      - name: Send to Telegram
+
+      - name: Send Telegram
+        run: python send_telegram.py
+
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          python send_telegram.py
+          run: python send_telegram.py
