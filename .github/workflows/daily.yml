@@ -1,9 +1,9 @@
 name: Daily Signal
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 15 * * 1-5"
+    - cron: "10 3 * * 1-5"
+  workflow_dispatch:
 
 jobs:
   run:
