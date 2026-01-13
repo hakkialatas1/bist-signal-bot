@@ -26,10 +26,6 @@ BIST100_CODES = [
 ]
 TICKERS_ALL = sorted(list(dict.fromkeys([c + ".IS" for c in BIST100_CODES])))
 
-import datetime as dt
-today_real = pd.Timestamp(dt.date.today())
-if last_date < today_real - pd.Timedelta(days=1):
-    print(f"⚠️ Veri güncel değil. Son veri: {last_date.date()}")
 
 # =========================
 # FINAL PARAMS (grid winner)
