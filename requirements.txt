@@ -1,5 +1,5 @@
-pandas
-numpy
-yfinance
-scikit-learn
-requests
+pandas==2.2.3
+numpy==2.1.3
+yfinance==0.2.54
+scikit-learn==1.5.2
+requests==2.32.3
