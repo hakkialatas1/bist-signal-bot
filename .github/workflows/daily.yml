@@ -1,8 +1,8 @@
-name: Daily Signal
+name: BIST + US Signal Bot
 
 on:
   schedule:
-    - cron: "10 3 * * 1-5"
+    - cron: "10 3 * * 1-5"   # 06:10 TR
   workflow_dispatch:
 
 jobs:
@@ -11,30 +11,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run BIST (try 1)
+        shell: bash
         run: |
-          pip install -r requirements.txt
+          python algo_step2_LIVE_TOP15.py || true
 
-      - name: Run algo (try 1)
-        run: python algo_step2_LIVE_TOP15.py || true
-
-      - name: Wait 2 minutes (rate-limit backoff)
+      - name: Wait 2 minutes
         run: sleep 120
 
-      - name: Run algo (try 2)
+      - name: Run BIST (try 2)
         run: python algo_step2_LIVE_TOP15.py
 
+      - name: Run US (try 1)
+        shell: bash
+        run: |
+          python algo_step2_US_LIVE_TOP15.py || true
 
+      - name: Wait 2 minutes
+        run: sleep 120
 
-      - name: Send Telegram
-        run: python send_telegram.py
+      - name: Run US (try 2)
+        run: python algo_step2_US_LIVE_TOP15.py
 
+      - name: Send Telegram (both)
+        run: python send_telegram_multi.py
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          run: python send_telegram.py
