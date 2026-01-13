@@ -5,6 +5,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import datetime as dt
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -75,7 +76,7 @@ def yf_download(tickers, start, end):
         progress=True,
     )
 
-def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
+def _normalize_ohlcv(df: pd.DataFrame, ticker: str):
     if df is None or df.empty:
         return None
 
@@ -110,7 +111,7 @@ def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     return df[["date","ticker","open","high","low","close","volume"]]
 
-def extract_one_ticker(raw: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
+def extract_one_ticker(raw: pd.DataFrame, ticker: str):
     if isinstance(raw.columns, pd.MultiIndex):
         for level in [1, 0]:
             try:
@@ -123,7 +124,7 @@ def extract_one_ticker(raw: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
         return None
     return _normalize_ohlcv(raw.copy(), ticker)
 
-def build_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+def build_panel(raw: pd.DataFrame, tickers):
     frames = []
     for t in tickers:
         sub = extract_one_ticker(raw, t)
@@ -159,6 +160,22 @@ def load_market_series(start: str, end):
     return None
 
 
+def last_date_from_raw(raw: pd.DataFrame):
+    """Raw download içinden en son tarihi bulmaya çalışır (hızlı freshness kontrol)."""
+    try:
+        if isinstance(raw.columns, pd.MultiIndex):
+            # any column -> take index
+            idx = raw.index
+        else:
+            idx = raw.index
+        if idx is None or len(idx) == 0:
+            return None
+        s = pd.to_datetime(pd.Index(idx), errors="coerce").dropna()
+        return s.max().normalize() if len(s) else None
+    except Exception:
+        return None
+
+
 # =========================
 # FEATURES
 # =========================
@@ -169,7 +186,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = up / (down + 1e-12)
     return 100 - (100 / (1 + rs))
 
-def add_features(panel: pd.DataFrame, mkt: pd.DataFrame | None) -> pd.DataFrame:
+def add_features(panel: pd.DataFrame, mkt):
     out = panel.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
@@ -378,7 +395,22 @@ def max_dd(eq: pd.Series) -> float:
 # =========================
 def main():
     print("1) Download BIST100 (Yahoo)...")
+
     raw = yf_download(TICKERS_ALL, START, END)
+
+    # Retry if data looks stale (Yahoo can lag)
+    today_local = pd.Timestamp(dt.date.today()).normalize()
+    raw_last = last_date_from_raw(raw)
+
+    for attempt in [1, 2]:
+        if raw_last is None:
+            break
+        age = int((today_local - raw_last).days)
+        if age <= 1:
+            break
+        print(f"⚠️ Yahoo verisi eski görünüyor (son: {raw_last.date()}, age={age} gün). Retry {attempt}/2 ...")
+        raw = yf_download(TICKERS_ALL, START, END)
+        raw_last = last_date_from_raw(raw)
 
     # Drop missing tickers
     if isinstance(raw.columns, pd.MultiIndex):
@@ -490,6 +522,12 @@ def main():
     if pd.isna(last_date):
         raise ValueError("Sinyal üretilemedi: trades boş.")
 
+    # --- DATA FRESHNESS CHECK (for Telegram / kill-switch) ---
+    last_norm = pd.to_datetime(last_date).normalize()
+    data_age_days = int((today_local - last_norm).days)
+    data_is_fresh = (data_age_days <= 1)  # 0-1 gün fark: kabul
+    freshness_note = "✅ GÜNCEL" if data_is_fresh else f"⚠️ GÜNCEL DEĞİL ({data_age_days} gün eski)"
+
     tdf = trades[trades["date"] == last_date].copy()
     tdf["w_final"] = pd.to_numeric(tdf["w_scaled"], errors="coerce").fillna(0.0)
     tdf = tdf[tdf["w_final"] > 0].copy()
@@ -501,7 +539,7 @@ def main():
     live = tdf[["date","ticker","weight_%","alloc_TL"]].reset_index(drop=True)
     live.to_csv("live_signal_today.csv", index=False)
 
-     # ===== ORDERS (AL / TUT / SAT) =====
+    # ===== ORDERS (AL / TUT / SAT) =====
     all_dates = sorted(trades["date"].dropna().unique())
     prev_date = all_dates[-2] if len(all_dates) >= 2 else None
     today_date = all_dates[-1]
@@ -512,14 +550,12 @@ def main():
     today_df = today_df[today_df["w_final"] > 0].copy()
     today_df = today_df.sort_values("w_final", ascending=False)
 
-    # sadece TOP_N ve min ağırlık filtresi
     MIN_TRADE_PCT = 0.20  # %0.20 altını yok say
     today_top = today_df.head(TOP_N).copy()
     today_top = today_top[(today_top["w_final"] * 100) >= MIN_TRADE_PCT].copy()
 
     today_top["alloc_TL"] = (today_top["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
     today_top["weight_%"] = (today_top["w_final"] * 100).round(3)
-
     today_set = set(today_top["ticker"].tolist())
 
     # --- DÜN: sadece TOP_N üzerinden SAT hesapla ---
@@ -537,36 +573,30 @@ def main():
 
     to_buy  = today_set - prev_set
     to_sell = prev_set - today_set
+
     # --- COOLDOWN: SAT sonrası X gün tekrar AL yapma ---
     COOLDOWN_DAYS = 5
-    # trades içinde "SAT" bilgisini tutmuyoruz; bunu prev_set - today_set ile üretiyoruz.
-    # Bu yüzden cooldown için "orders_today.csv" yerine, geçmiş sinyal günlerinden bir "top-set" geçmişi çıkarıyoruz.
-    # Son N gün için top setleri hesaplayıp "çıkış" yakalayacağız
-    recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]  # biraz tampon
+    recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]  # tampon
     top_sets = {}
 
-    for d in recent_dates:
-        df_d = trades[trades["date"] == d].copy()
+    for d0 in recent_dates:
+        df_d = trades[trades["date"] == d0].copy()
         df_d["w_d"] = pd.to_numeric(df_d["w_scaled"], errors="coerce").fillna(0.0)
         df_d = df_d[df_d["w_d"] > 0].sort_values("w_d", ascending=False).head(TOP_N)
-        top_sets[d] = set(df_d["ticker"].tolist())
+        top_sets[d0] = set(df_d["ticker"].tolist())
 
-    # cooldown listesi: son COOLDOWN_DAYS içinde "top listeden çıkmış" hisseler
     cooldown_block = set()
     for i in range(1, len(recent_dates)):
         d_prev = recent_dates[i-1]
         d_cur  = recent_dates[i]
-        prev_set_i = top_sets.get(d_prev, set())
-        cur_set_i  = top_sets.get(d_cur, set())
-        exited = prev_set_i - cur_set_i
+        exited = top_sets.get(d_prev, set()) - top_sets.get(d_cur, set())
         cooldown_block |= exited
 
-    # BUGÜN için AL listesinde olup cooldown'da olanları çıkar
     to_buy = {t for t in to_buy if t not in cooldown_block}
 
     orders = []
 
-    # AL / TUT (bugünkü TOP_N hedefleri)
+    # AL / TUT
     for _, r in today_top.iterrows():
         t = r["ticker"]
         side = "AL" if t in to_buy else "TUT"
@@ -576,10 +606,13 @@ def main():
             "ticker": t,
             "target_weight_%": float(r["weight_%"]),
             "target_alloc_TL": int(r["alloc_TL"]),
-            "note": "T+1 açılış/ilk likit"
+            "note": "T+1 açılış/ilk likit",
+            "data_date": str(last_norm.date()),
+            "fresh": int(data_is_fresh),
+            "fresh_note": freshness_note
         })
 
-    # SAT (dünkü TOP_N'de olup bugünkü TOP_N'de olmayanlar)
+    # SAT
     for t in sorted(list(to_sell)):
         orders.append({
             "date": str(pd.to_datetime(today_date).date()),
@@ -587,7 +620,10 @@ def main():
             "ticker": t,
             "target_weight_%": 0.0,
             "target_alloc_TL": 0,
-            "note": "Listeden çıktı → T+1 açılış/ilk likit"
+            "note": "Listeden çıktı → T+1 açılış/ilk likit",
+            "data_date": str(last_norm.date()),
+            "fresh": int(data_is_fresh),
+            "fresh_note": freshness_note
         })
 
     orders_df = pd.DataFrame(orders)
@@ -596,26 +632,8 @@ def main():
 
     with open("orders_today.txt", "w", encoding="utf-8") as f:
         f.write(f"ORDERS (BIST100 TOP{TOP_N})\n")
-        f.write(f"Signal date: {pd.to_datetime(today_date).date()} | Execute: next session open/first liquid\n\n")
-        f.write(orders_df.to_string(index=False))
-
-
-    for t in sorted(list(to_sell)):
-        orders.append({
-            "date": str(pd.to_datetime(today_date).date()),
-            "side": "SAT",
-            "ticker": t,
-            "target_weight_%": 0.0,
-            "target_alloc_TL": 0,
-            "note": "Listeden çıktı → T+1 açılış/ilk likit"
-        })
-
-    orders_df = pd.DataFrame(orders)
-    orders_df.to_csv("orders_today.csv", index=False)
-
-    with open("orders_today.txt", "w", encoding="utf-8") as f:
-        f.write(f"ORDERS (BIST100 TOP{TOP_N})\n")
-        f.write(f"Signal date: {pd.to_datetime(today_date).date()} | Execute: next session open/first liquid\n\n")
+        f.write(f"Signal date: {pd.to_datetime(today_date).date()} | Execute: next session open/first liquid\n")
+        f.write(f"Data date: {last_norm.date()} | {freshness_note}\n\n")
         f.write(orders_df.to_string(index=False))
 
     print("\n✅ Üretilen dosyalar:")
@@ -625,6 +643,7 @@ def main():
     print(" - equity_curve_live.csv")
     print(" - report_live.csv")
     print(f"\nSignal date: {pd.to_datetime(today_date).date()}")
+    print(f"Data date: {last_norm.date()} | {freshness_note}")
     print("\nİlk 10 emir:")
     print(orders_df.head(10).to_string(index=False))
 
