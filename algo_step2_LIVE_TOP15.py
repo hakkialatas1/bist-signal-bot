@@ -524,18 +524,29 @@ def main():
     else:
         prev_df = pd.DataFrame(columns=["ticker","w_prev"])
 
-    today_set = set(today_df["ticker"].tolist())
-    prev_set  = set(prev_df["ticker"].tolist())
+       # ✅ Bugünün TOP15 seti
+       today_top = today_df.sort_values("w_final", ascending=False).head(TOP_N).copy()
+       today_set = set(today_top["ticker"].tolist())
 
-    to_buy  = today_set - prev_set
+       # ✅ Dünün TOP15 seti
+if prev_date is not None and not prev_df.empty:
+    prev_top = prev_df.sort_values("w_prev", ascending=False).head(TOP_N).copy()
+    prev_set = set(prev_top["ticker"].tolist())
+else:
+    prev_top = pd.DataFrame(columns=today_top.columns)
+    prev_set = set()
+
+to_buy  = today_set - prev_set
+to_sell = prev_set - today_set
+
     MIN_TRADE_PCT = 0.20  # %0.20 altını yok say
     prev_df["w_prev_pct"] = pd.to_numeric(prev_df["w_prev"], errors="coerce").fillna(0.0) * 100
     prev_df = prev_df[prev_df["w_prev_pct"] >= MIN_TRADE_PCT].copy()
-    to_sell = prev_set - today_set
+    
 
     orders = []
 
-    for _, r in today_df.iterrows():
+    for _, r in today_top.iterrows():
         t = r["ticker"]
         side = "AL" if t in to_buy else "TUT"
         orders.append({
