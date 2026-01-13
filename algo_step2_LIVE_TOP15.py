@@ -501,51 +501,46 @@ def main():
     live = tdf[["date","ticker","weight_%","alloc_TL"]].reset_index(drop=True)
     live.to_csv("live_signal_today.csv", index=False)
 
-    # ===== ORDERS (AL / TUT / SAT) =====
+     # ===== ORDERS (AL / TUT / SAT) =====
     all_dates = sorted(trades["date"].dropna().unique())
     prev_date = all_dates[-2] if len(all_dates) >= 2 else None
     today_date = all_dates[-1]
 
+    # --- BUGÜN: hedef portföy (TOP_N) ---
     today_df = trades[trades["date"] == today_date].copy()
     today_df["w_final"] = pd.to_numeric(today_df["w_scaled"], errors="coerce").fillna(0.0)
     today_df = today_df[today_df["w_final"] > 0].copy()
     today_df = today_df.sort_values("w_final", ascending=False)
-    today_df = today_df.head(TOP_N).copy()
-    MIN_PRINT_PCT = 0.20  # %0.20 altını gösterme
-    today_df = today_df[today_df["w_final"] * 100 >= MIN_PRINT_PCT].copy()
 
-    today_df["alloc_TL"] = (today_df["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
-    today_df["weight_%"] = (today_df["w_final"] * 100).round(3)
+    # sadece TOP_N ve min ağırlık filtresi
+    MIN_TRADE_PCT = 0.20  # %0.20 altını yok say
+    today_top = today_df.head(TOP_N).copy()
+    today_top = today_top[(today_top["w_final"] * 100) >= MIN_TRADE_PCT].copy()
 
+    today_top["alloc_TL"] = (today_top["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
+    today_top["weight_%"] = (today_top["w_final"] * 100).round(3)
+
+    today_set = set(today_top["ticker"].tolist())
+
+    # --- DÜN: sadece TOP_N üzerinden SAT hesapla ---
     if prev_date is not None:
         prev_df = trades[trades["date"] == prev_date].copy()
         prev_df["w_prev"] = pd.to_numeric(prev_df["w_scaled"], errors="coerce").fillna(0.0)
         prev_df = prev_df[prev_df["w_prev"] > 0].copy()
+        prev_df = prev_df.sort_values("w_prev", ascending=False)
+
+        prev_top = prev_df.head(TOP_N).copy()
+        prev_top = prev_top[(prev_top["w_prev"] * 100) >= MIN_TRADE_PCT].copy()
+        prev_set = set(prev_top["ticker"].tolist())
     else:
-        prev_df = pd.DataFrame(columns=["ticker","w_prev"])
+        prev_set = set()
 
-       # ✅ Bugünün TOP15 seti
-       today_top = today_df.sort_values("w_final", ascending=False).head(TOP_N).copy()
-       today_set = set(today_top["ticker"].tolist())
-
-       # ✅ Dünün TOP15 seti
-if prev_date is not None and not prev_df.empty:
-    prev_top = prev_df.sort_values("w_prev", ascending=False).head(TOP_N).copy()
-    prev_set = set(prev_top["ticker"].tolist())
-else:
-    prev_top = pd.DataFrame(columns=today_top.columns)
-    prev_set = set()
-
-to_buy  = today_set - prev_set
-to_sell = prev_set - today_set
-
-    MIN_TRADE_PCT = 0.20  # %0.20 altını yok say
-    prev_df["w_prev_pct"] = pd.to_numeric(prev_df["w_prev"], errors="coerce").fillna(0.0) * 100
-    prev_df = prev_df[prev_df["w_prev_pct"] >= MIN_TRADE_PCT].copy()
-    
+    to_buy  = today_set - prev_set
+    to_sell = prev_set - today_set
 
     orders = []
 
+    # AL / TUT (bugünkü TOP_N hedefleri)
     for _, r in today_top.iterrows():
         t = r["ticker"]
         side = "AL" if t in to_buy else "TUT"
@@ -557,6 +552,26 @@ to_sell = prev_set - today_set
             "target_alloc_TL": int(r["alloc_TL"]),
             "note": "T+1 açılış/ilk likit"
         })
+
+    # SAT (dünkü TOP_N'de olup bugünkü TOP_N'de olmayanlar)
+    for t in sorted(list(to_sell)):
+        orders.append({
+            "date": str(pd.to_datetime(today_date).date()),
+            "side": "SAT",
+            "ticker": t,
+            "target_weight_%": 0.0,
+            "target_alloc_TL": 0,
+            "note": "Listeden çıktı → T+1 açılış/ilk likit"
+        })
+
+    orders_df = pd.DataFrame(orders)
+    orders_df.to_csv("orders_today.csv", index=False)
+
+    with open("orders_today.txt", "w", encoding="utf-8") as f:
+        f.write(f"ORDERS (BIST100 TOP{TOP_N})\n")
+        f.write(f"Signal date: {pd.to_datetime(today_date).date()} | Execute: next session open/first liquid\n\n")
+        f.write(orders_df.to_string(index=False))
+
 
     for t in sorted(list(to_sell)):
         orders.append({
