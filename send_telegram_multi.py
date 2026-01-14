@@ -118,7 +118,7 @@ def build_msg(orders_path: str, title: str, top_n: int = 15) -> str:
 
 def main():
     # ✅ BIST dosyası
-    bist_msg = build_msg("orders_bist.csv", "BIST100 SİNYAL", top_n=15)
+    bist_msg = build_msg("orders_today.csv", "BIST100 SİNYAL", top_n=15)
     send_message(bist_msg)
 
     # ✅ US dosyası (BURASI DÜZELTİLDİ)
