@@ -1,10 +1,12 @@
 # algo_step2_LIVE_TOP15.py
-# BIST100 TOP15 LIVE signal generator (Step-2+) + Parquet cache + Freshness + Cooldown
+# BIST100 LIVE stabilized: Yahoo rate-limit resistant + parquet cache + tz-safe + LIVE signal on latest feature date
 # Outputs:
 #  - orders_today.csv
 #  - live_signal_today.csv
 #  - equity_curve_live.csv
 #  - report_live.csv
+#
+# NOTE: This is a research/demo tool, not investment advice.
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -17,7 +19,7 @@ import yfinance as yf
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 # =========================
-# UNIVERSE (embedded BIST list)
+# UNIVERSE (embedded list)
 # =========================
 BIST100_CODES = [
     "AKBNK","ALARK","ARCLK","ASELS","BIMAS","BRSAN","CCOLA","DOHOL","ECILC","EGEEN",
@@ -64,35 +66,51 @@ VOL_Q_GRID = [0.55, 0.65, 0.75]
 INIT_CAPITAL_TL = 100_000
 MARKET_CANDIDATES = ["XU100.IS", "^XU100"]
 
-# Freshness
-MAX_STALENESS_DAYS = 2  # 2 günden eskiyse NO TRADE
+# freshness / kill-switch
+MAX_STALENESS_DAYS = 2
+MIN_TRADE_PCT = 0.20
+COOLDOWN_DAYS = 5
 
-# Cache
+# cache
 DATA_DIR = Path("data")
 CACHE_FILE = DATA_DIR / "bist_ohlcv.parquet"
 INCREMENTAL_LOOKBACK_DAYS = 10
 
-# Orders
-MIN_TRADE_PCT = 0.20
-COOLDOWN_DAYS = 5
+# yahoo download stability
+CHUNK_SIZE = 6          # smaller = fewer blocks
+MAX_RETRIES = 7
+SLEEP_BASE = 2.0
 
 # =========================
-# Helpers
+# Time helpers (tz-safe)
 # =========================
 def today_utc_naive() -> pd.Timestamp:
-    # always tz-naive, to avoid tz-aware/naive subtraction errors
     return pd.Timestamp.utcnow().tz_localize(None).normalize()
+
+def normalize_ts(x) -> pd.Timestamp | None:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    ts = pd.to_datetime(x, errors="coerce")
+    if ts is pd.NaT:
+        return None
+    if getattr(ts, "tzinfo", None) is not None:
+        ts = ts.tz_localize(None)
+    return ts.normalize()
 
 def safe_print(msg: str) -> None:
     print(msg, flush=True)
 
-def yf_download_chunked(tickers, start, end, chunk_size=12, max_retries=6, sleep_base=2.0):
+# =========================
+# Yahoo download (chunk + backoff)
+# =========================
+def yf_download_chunked(tickers, start, end, chunk_size=CHUNK_SIZE, max_retries=MAX_RETRIES, sleep_base=SLEEP_BASE):
     all_raw = None
     tickers = list(tickers)
 
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i+chunk_size]
         last_err = None
+
         for r in range(max_retries):
             try:
                 raw = yf.download(
@@ -101,8 +119,8 @@ def yf_download_chunked(tickers, start, end, chunk_size=12, max_retries=6, sleep
                     end=end,
                     auto_adjust=False,
                     group_by="column",
-                    threads=True,
-                    progress=False,
+                    threads=False,      # IMPORTANT: reduce rate-limit pressure
+                    progress=True,
                 )
                 if all_raw is None:
                     all_raw = raw
@@ -113,16 +131,20 @@ def yf_download_chunked(tickers, start, end, chunk_size=12, max_retries=6, sleep
             except Exception as e:
                 last_err = e
                 wait = sleep_base * (2 ** r)
-                safe_print(f"Download retry {r+1}/{max_retries} chunk#{i//chunk_size+1} err={type(e).__name__} wait={wait:.1f}s")
+                safe_print(f"Download retry {r+1}/{max_retries} err={type(e).__name__} wait={wait:.1f}s")
                 time.sleep(wait)
 
         if last_err is not None:
-            safe_print(f"Chunk permanently failed: {chunk[:3]}... err={last_err}")
+            safe_print(f"Chunk failed: {chunk[:3]}... err={last_err}")
 
-        time.sleep(0.3)
+        # gentle pacing between chunks
+        time.sleep(0.8)
 
     return all_raw if all_raw is not None else pd.DataFrame()
 
+# =========================
+# Raw -> Panel
+# =========================
 def _normalize_one(df: pd.DataFrame, ticker: str):
     if df is None or df.empty:
         return None
@@ -146,6 +168,7 @@ def _normalize_one(df: pd.DataFrame, ticker: str):
     out = out.reset_index().rename(columns={out.reset_index().columns[0]: "date"})
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
     out["ticker"] = ticker
+
     for c in needed:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -155,10 +178,10 @@ def _normalize_one(df: pd.DataFrame, ticker: str):
     return out[["date","ticker","open","high","low","close","volume"]]
 
 def raw_to_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-    frames = []
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
 
+    frames = []
     if isinstance(raw.columns, pd.MultiIndex):
         for t in tickers:
             sub = None
@@ -174,7 +197,6 @@ def raw_to_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             if one is not None:
                 frames.append(one)
     else:
-        # fallback (rare)
         one = _normalize_one(raw.copy(), tickers[0] if tickers else "NA")
         if one is not None:
             frames.append(one)
@@ -184,7 +206,8 @@ def raw_to_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
 
     panel = pd.concat(frames, ignore_index=True)
     panel["date"] = pd.to_datetime(panel["date"], errors="coerce").dt.normalize()
-    return panel.dropna(subset=["date","ticker","close"]).sort_values(["ticker","date"]).reset_index(drop=True)
+    panel = panel.dropna(subset=["date","ticker","close"]).drop_duplicates(subset=["date","ticker"], keep="last")
+    return panel.sort_values(["ticker","date"]).reset_index(drop=True)
 
 def load_cache(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -205,36 +228,35 @@ def update_cache(tickers: list[str], cache_path: Path, start_fallback: str, end)
     cache = load_cache(cache_path)
 
     if not cache.empty:
-        last_dt = pd.to_datetime(cache["date"].max()).normalize()
+        last_dt = normalize_ts(cache["date"].max())
         dl_start = str((last_dt - pd.Timedelta(days=INCREMENTAL_LOOKBACK_DAYS)).date())
         safe_print(f"Cache var. Son tarih={last_dt.date()} → incremental start={dl_start}")
     else:
-        last_dt = None
         dl_start = start_fallback
         safe_print(f"Cache yok. Full download start={dl_start}")
 
-    raw = yf_download_chunked(tickers, dl_start, end, chunk_size=12, max_retries=6)
+    raw = yf_download_chunked(tickers, dl_start, end)
     new_panel = raw_to_panel(raw, tickers)
 
     if new_panel.empty:
         if cache.empty:
             return cache, None, "⛔ VERİ YOK (Yahoo rate-limit / erişim)"
-        data_date = pd.to_datetime(cache["date"].max()).normalize()
+        data_date = normalize_ts(cache["date"].max())
         return cache, data_date, "⚠️ Yahoo erişim yok → CACHE ile devam"
 
     merged = pd.concat([cache, new_panel], ignore_index=True)
     merged["date"] = pd.to_datetime(merged["date"], errors="coerce").dt.normalize()
     merged = merged.dropna(subset=["date","ticker","close"]).drop_duplicates(subset=["date","ticker"], keep="last")
     merged = merged.sort_values(["ticker","date"]).reset_index(drop=True)
-    save_cache(merged, cache_path)
 
-    data_date = pd.to_datetime(merged["date"].max()).normalize() if not merged.empty else None
+    save_cache(merged, cache_path)
+    data_date = normalize_ts(merged["date"].max())
     return merged, data_date, "✅ Yahoo güncel/cached"
 
 def load_market_series(start: str, end):
     for sym in MARKET_CANDIDATES:
         try:
-            df = yf.download(sym, start=start, end=end, auto_adjust=False, progress=False)
+            df = yf.download(sym, start=start, end=end, auto_adjust=False, progress=False, threads=False)
             if df is None or df.empty:
                 continue
             df = df.reset_index().rename(columns={df.reset_index().columns[0]: "date"})
@@ -271,7 +293,6 @@ def add_features(panel: pd.DataFrame, mkt: pd.DataFrame | None) -> pd.DataFrame:
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
     out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
     out = out.dropna(subset=["date", "ticker", "close"]).copy()
-
     g = out.groupby("ticker", group_keys=False)
 
     out["ret_1"]  = g["close"].apply(lambda s: np.log(s / s.shift(1)))
@@ -299,7 +320,6 @@ def add_features(panel: pd.DataFrame, mkt: pd.DataFrame | None) -> pd.DataFrame:
     out["dv"] = (out["close"].abs() * out["volume"]).astype(float)
     out["dv20"] = g["dv"].apply(lambda s: s.rolling(20).mean())
 
-    # label
     out["y_fwd"] = g["close"].apply(lambda s: np.log(s.shift(-HORIZON) / s))
 
     if mkt is not None:
@@ -351,7 +371,7 @@ FEATURES = [
 ]
 
 # =========================
-# Walk-forward + Risk
+# Core (backtest)
 # =========================
 def walk_forward_dates(dates: np.ndarray, train_days: int, test_days: int, step_days: int):
     i, n = 0, len(dates)
@@ -394,9 +414,6 @@ def ema_by_ticker(df: pd.DataFrame, col: str, alpha: float) -> pd.Series:
         out[i] = last
     return pd.Series(out, index=df.index)
 
-# =========================
-# Backtest
-# =========================
 def backtest(preds: pd.DataFrame, vol_thr: pd.Series, top_n: int):
     out = preds.copy().reset_index(drop=True)
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
@@ -456,7 +473,6 @@ def backtest(preds: pd.DataFrame, vol_thr: pd.Series, top_n: int):
 
     out = out.merge(scale.rename("port_scale"), left_on="date", right_index=True, how="left")
     out["w_scaled"] = out["w"] * out["port_scale"].fillna(1.0)
-
     return out, daily
 
 def sharpe(x: pd.Series) -> float:
@@ -468,6 +484,42 @@ def max_dd(eq: pd.Series) -> float:
     return float((eq / peak - 1.0).min())
 
 # =========================
+# LIVE signal on latest feature date (fix)
+# =========================
+def build_live_signal(panel_feat: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    train_df = panel_feat.dropna(subset=FEATURES + ["y_fwd"]).copy()
+    dates = np.array(sorted(train_df["date"].unique()))
+    if len(dates) < (TRAIN_DAYS + 60):
+        return pd.DataFrame()
+
+    train_dates = dates[-TRAIN_DAYS:]
+    train_slice = train_df[train_df["date"].isin(train_dates)].copy()
+
+    model = HistGradientBoostingRegressor(
+        learning_rate=0.05, max_depth=6, max_iter=800, random_state=42
+    )
+    model.fit(train_slice[FEATURES], train_slice["y_fwd"].astype(float))
+
+    sig_df = panel_feat.dropna(subset=FEATURES).copy()
+    last_date = sig_df["date"].max()
+    day = sig_df[sig_df["date"] == last_date].copy()
+    day["mu_hat"] = model.predict(day[FEATURES])
+
+    day["vol_20"] = pd.to_numeric(day["vol_20"], errors="coerce")
+    day["score"] = day["mu_hat"] - (LAMBDA_VOL * day["vol_20"].fillna(day["vol_20"].median()))
+
+    day = day.sort_values("score", ascending=False).head(top_n).copy()
+
+    day["w_raw"] = 1.0 / max(len(day), 1)
+    day["w_raw"] = (day["w_raw"] * GROSS_CAP).clip(0.0, POS_CAP)
+
+    day["w_final"] = day["w_raw"]
+    day["weight_%"] = (day["w_final"] * 100).round(3)
+    day["alloc_TL"] = (day["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
+
+    return day[["date","ticker","w_final","weight_%","alloc_TL"]].reset_index(drop=True)
+
+# =========================
 # MAIN
 # =========================
 def main():
@@ -476,6 +528,7 @@ def main():
 
     today = today_utc_naive()
 
+    # kill-switch if no data
     if panel is None or panel.empty or data_date is None:
         orders_df = pd.DataFrame([{
             "date": str(today.date()),
@@ -492,187 +545,143 @@ def main():
         safe_print("Panel yok → orders_today.csv yazıldı (kill-switch).")
         return
 
-    # tz-safe data_date normalize
-    data_date = pd.to_datetime(data_date, errors="coerce")
-    if getattr(data_date, "tzinfo", None) is not None:
-        data_date = data_date.tz_localize(None)
-    data_date = data_date.normalize()
-
+    data_date = normalize_ts(data_date)
     staleness = int((today - data_date).days)
-    if staleness <= MAX_STALENESS_DAYS:
-        fresh = 1
-        fresh_note = "✅ GÜNCEL"
-    else:
-        fresh = 0
-        fresh_note = f"⚠️ GÜNCEL DEĞİL ({staleness} gün eski)"
-
+    fresh = 1 if staleness <= MAX_STALENESS_DAYS else 0
+    fresh_note = "✅ GÜNCEL" if fresh else f"⚠️ GÜNCEL DEĞİL ({staleness} gün eski)"
     safe_print(f"Data date: {data_date.date()} | {fetch_note} | {fresh_note}")
 
     mkt = load_market_series(START, END)
 
     safe_print("2) Features...")
-    panel = add_features(panel, mkt)
-    need = ["date","ticker","ret_1","vol_20","dv20","y_fwd"] + FEATURES
-    panel = panel.dropna(subset=need).copy()
-    panel = panel.sort_values(["date","ticker"]).reset_index(drop=True)
+    panel_feat = add_features(panel, mkt)
+    panel_feat = panel_feat.sort_values(["date","ticker"]).reset_index(drop=True)
 
-    dates = np.array(sorted(panel["date"].unique()))
-    if len(dates) < (TRAIN_DAYS + TEST_DAYS + 50):
-        orders_df = pd.DataFrame([{
-            "date": str(today.date()),
-            "side": "NONE",
-            "ticker": "NA",
-            "target_weight_%": 0.0,
-            "target_alloc_TL": 0,
-            "note": "YETERSİZ GÜN",
-            "data_date": str(data_date.date()),
-            "fresh": 0,
-            "fresh_note": "⛔ Yetersiz tarih → BUGÜN İŞLEM YOK"
-        }])
-        orders_df.to_csv("orders_today.csv", index=False)
-        safe_print(f"Yetersiz gün: {len(dates)} → kill-switch")
-        return
-
-    safe_print("3) Walk-forward...")
+    # optional: walk-forward performance files
+    safe_print("3) Walk-forward backtest...")
+    wf_df = panel_feat.dropna(subset=["date","ticker"] + FEATURES + ["y_fwd","ret_1","vol_20","dv20"]).copy()
+    dates = np.array(sorted(wf_df["date"].unique()))
     trades_chunks = []
     daily_chunks = []
 
-    for fold, (train_dates, test_dates) in enumerate(
-        walk_forward_dates(dates, TRAIN_DAYS, TEST_DAYS, STEP_DAYS), start=1
-    ):
-        train = panel[panel["date"].isin(train_dates)].copy()
-        test  = panel[panel["date"].isin(test_dates)].copy()
-        if train.empty or test.empty:
-            continue
+    if len(dates) >= (TRAIN_DAYS + TEST_DAYS + 50):
+        for fold, (train_dates, test_dates) in enumerate(
+            walk_forward_dates(dates, TRAIN_DAYS, TEST_DAYS, STEP_DAYS), start=1
+        ):
+            train = wf_df[wf_df["date"].isin(train_dates)].copy()
+            test  = wf_df[wf_df["date"].isin(test_dates)].copy()
+            if train.empty or test.empty:
+                continue
 
-        tr_dates = np.array(sorted(train["date"].unique()))
-        split = int(len(tr_dates) * 0.8)
-        trd, vad = tr_dates[:split], tr_dates[split:]
-        tr_df = train[train["date"].isin(trd)].copy()
-        va_df = train[train["date"].isin(vad)].copy()
-        if tr_df.empty or va_df.empty:
-            continue
+            tr_dates = np.array(sorted(train["date"].unique()))
+            split = int(len(tr_dates) * 0.8)
+            trd, vad = tr_dates[:split], tr_dates[split:]
+            tr_df = train[train["date"].isin(trd)].copy()
+            va_df = train[train["date"].isin(vad)].copy()
+            if tr_df.empty or va_df.empty:
+                continue
 
-        model = HistGradientBoostingRegressor(
-            learning_rate=0.05, max_depth=6, max_iter=800, random_state=42
-        )
-        model.fit(tr_df[FEATURES], tr_df["y_fwd"].astype(float))
-
-        va_pred = va_df[["date","ticker","ret_1","vol_20","dv20"]].copy()
-        va_pred["mu_hat"] = model.predict(va_df[FEATURES])
-
-        best = (-1e9, VOL_Q_GRID[0])
-        for vol_q in VOL_Q_GRID:
-            thr_va = compute_vol_thr_from_context(
-                pd.concat([tr_df[["date","vol_20"]], va_pred[["date","vol_20"]]]),
-                vol_q
+            model = HistGradientBoostingRegressor(
+                learning_rate=0.05, max_depth=6, max_iter=800, random_state=42
             )
-            _, d_va = backtest(va_pred, thr_va, TOP_N)
-            s = sharpe(d_va["pnl_scaled"])
-            if s > best[0]:
-                best = (s, vol_q)
-        vol_q_best = best[1]
+            model.fit(tr_df[FEATURES], tr_df["y_fwd"].astype(float))
 
-        model.fit(train[FEATURES], train["y_fwd"].astype(float))
+            va_pred = va_df[["date","ticker","ret_1","vol_20","dv20"]].copy()
+            va_pred["mu_hat"] = model.predict(va_df[FEATURES])
 
-        te_pred = test[["date","ticker","ret_1","vol_20","dv20"]].copy()
-        te_pred["mu_hat"] = model.predict(test[FEATURES])
+            best = (-1e9, VOL_Q_GRID[0])
+            for vol_q in VOL_Q_GRID:
+                thr_va = compute_vol_thr_from_context(
+                    pd.concat([tr_df[["date","vol_20"]], va_pred[["date","vol_20"]]]),
+                    vol_q
+                )
+                _, d_va = backtest(va_pred, thr_va, TOP_N)
+                s = sharpe(d_va["pnl_scaled"])
+                if s > best[0]:
+                    best = (s, vol_q)
+            vol_q_best = best[1]
 
-        thr_te = compute_vol_thr_from_context(
-            pd.concat([train[["date","vol_20"]], te_pred[["date","vol_20"]]]),
-            vol_q_best
-        )
+            model.fit(train[FEATURES], train["y_fwd"].astype(float))
 
-        bt, d = backtest(te_pred, thr_te, TOP_N)
-        bt["fold"] = fold
-        trades_chunks.append(bt)
-        daily_chunks.append(d)
+            te_pred = test[["date","ticker","ret_1","vol_20","dv20"]].copy()
+            te_pred["mu_hat"] = model.predict(test[FEATURES])
 
-    if not trades_chunks:
+            thr_te = compute_vol_thr_from_context(
+                pd.concat([train[["date","vol_20"]], te_pred[["date","vol_20"]]]),
+                vol_q_best
+            )
+            bt, d = backtest(te_pred, thr_te, TOP_N)
+            bt["fold"] = fold
+            trades_chunks.append(bt)
+            daily_chunks.append(d)
+
+    if daily_chunks:
+        all_daily = pd.concat(daily_chunks)
+        if "date" not in all_daily.columns:
+            all_daily = all_daily.reset_index().rename(columns={"index":"date"})
+        all_daily["date"] = pd.to_datetime(all_daily["date"], errors="coerce").dt.normalize()
+        daily = all_daily.groupby("date")[["pnl","pnl_scaled","scale"]].mean().sort_index()
+        daily["equity"] = np.exp(daily["pnl"].cumsum())
+        daily["equity_scaled"] = np.exp(daily["pnl_scaled"].cumsum())
+        daily.to_csv("equity_curve_live.csv")
+
+        rep = pd.DataFrame([{
+            "end_capital_TL": INIT_CAPITAL_TL * float(daily["equity_scaled"].iloc[-1]),
+            "pnl_TL": INIT_CAPITAL_TL * float(daily["equity_scaled"].iloc[-1]) - INIT_CAPITAL_TL,
+            "return_%": (float(daily["equity_scaled"].iloc[-1]) - 1.0) * 100,
+            "sharpe": sharpe(daily["pnl_scaled"]),
+            "maxDD_%": max_dd(daily["equity_scaled"]) * 100,
+            "days": len(daily)
+        }])
+        rep.to_csv("report_live.csv", index=False)
+
+    # LIVE signal (always latest feature date)
+    safe_print("4) LIVE signal on latest date (fix stale signal)...")
+    live = build_live_signal(panel_feat, TOP_N)
+
+    if live.empty:
         orders_df = pd.DataFrame([{
             "date": str(today.date()),
             "side": "NONE",
             "ticker": "NA",
             "target_weight_%": 0.0,
             "target_alloc_TL": 0,
-            "note": "TRADES BOŞ",
+            "note": "SİNYAL ÜRETİLEMEDİ",
             "data_date": str(data_date.date()),
-            "fresh": 0,
-            "fresh_note": "⛔ Sinyal üretilemedi → BUGÜN İŞLEM YOK"
+            "fresh": int(fresh),
+            "fresh_note": fresh_note
         }])
         orders_df.to_csv("orders_today.csv", index=False)
-        safe_print("Trades boş → kill-switch")
         return
 
-    trades = pd.concat(trades_chunks, ignore_index=True)
-
-    # daily aggregation (fixed)
-    all_daily = pd.concat(daily_chunks)
-    if "date" not in all_daily.columns:
-        all_daily = all_daily.reset_index().rename(columns={"index":"date"})
-    all_daily["date"] = pd.to_datetime(all_daily["date"], errors="coerce").dt.normalize()
-    daily = all_daily.groupby("date")[["pnl","pnl_scaled","scale"]].mean().sort_index()
-    daily["equity"] = np.exp(daily["pnl"].cumsum())
-    daily["equity_scaled"] = np.exp(daily["pnl_scaled"].cumsum())
-    daily.to_csv("equity_curve_live.csv")
-
-    rep = pd.DataFrame([{
-        "end_capital_TL": INIT_CAPITAL_TL * float(daily["equity_scaled"].iloc[-1]),
-        "pnl_TL": INIT_CAPITAL_TL * float(daily["equity_scaled"].iloc[-1]) - INIT_CAPITAL_TL,
-        "return_%": (float(daily["equity_scaled"].iloc[-1]) - 1.0) * 100,
-        "sharpe": sharpe(daily["pnl_scaled"]),
-        "maxDD_%": max_dd(daily["equity_scaled"]) * 100,
-        "days": len(daily)
-    }])
-    rep.to_csv("report_live.csv", index=False)
-
-    # live signal
-    last_date = pd.to_datetime(trades["date"].dropna().max()).normalize()
-    tdf = trades[trades["date"] == last_date].copy()
-    tdf["w_final"] = pd.to_numeric(tdf["w_scaled"], errors="coerce").fillna(0.0)
-    tdf = tdf[tdf["w_final"] > 0].copy().sort_values("w_final", ascending=False)
-
-    tdf["alloc_TL"] = (tdf["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
-    tdf["weight_%"] = (tdf["w_final"] * 100).round(3)
-    live = tdf[["date","ticker","weight_%","alloc_TL"]].reset_index(drop=True)
     live.to_csv("live_signal_today.csv", index=False)
 
-    # orders from TOP_N sets
-    all_dates = sorted(pd.to_datetime(trades["date"].dropna().unique()).normalize())
+    signal_date = normalize_ts(live["date"].max())
+    today_set = set(live["ticker"].tolist())
+
+    # build prev set (yesterday) via same live builder on truncated data
+    all_dates = sorted(panel_feat["date"].dropna().unique())
+    all_dates = [normalize_ts(d) for d in all_dates if normalize_ts(d) is not None]
+    all_dates = sorted(list(dict.fromkeys(all_dates)))
     prev_date = all_dates[-2] if len(all_dates) >= 2 else None
-    today_date = all_dates[-1]
-
-    today_df = trades[pd.to_datetime(trades["date"]).dt.normalize() == today_date].copy()
-    today_df["w_final"] = pd.to_numeric(today_df["w_scaled"], errors="coerce").fillna(0.0)
-    today_df = today_df[today_df["w_final"] > 0].copy().sort_values("w_final", ascending=False)
-
-    today_top = today_df.head(TOP_N).copy()
-    today_top = today_top[(today_top["w_final"] * 100) >= MIN_TRADE_PCT].copy()
-    today_top["alloc_TL"] = (today_top["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
-    today_top["weight_%"] = (today_top["w_final"] * 100).round(3)
-    today_set = set(today_top["ticker"].tolist())
 
     if prev_date is not None:
-        prev_df = trades[pd.to_datetime(trades["date"]).dt.normalize() == prev_date].copy()
-        prev_df["w_prev"] = pd.to_numeric(prev_df["w_scaled"], errors="coerce").fillna(0.0)
-        prev_df = prev_df[prev_df["w_prev"] > 0].copy().sort_values("w_prev", ascending=False)
-        prev_top = prev_df.head(TOP_N).copy()
-        prev_top = prev_top[(prev_top["w_prev"] * 100) >= MIN_TRADE_PCT].copy()
-        prev_set = set(prev_top["ticker"].tolist())
+        prev_feat = panel_feat[panel_feat["date"] <= prev_date].copy()
+        prev_live = build_live_signal(prev_feat, TOP_N)
+        prev_set = set(prev_live["ticker"].tolist()) if not prev_live.empty else set()
     else:
         prev_set = set()
 
     to_buy  = today_set - prev_set
     to_sell = prev_set - today_set
 
-    # cooldown block
+    # cooldown block (avoid flip-flop)
     recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]
     top_sets = {}
     for d in recent_dates:
-        df_d = trades[pd.to_datetime(trades["date"]).dt.normalize() == d].copy()
-        df_d["w_d"] = pd.to_numeric(df_d["w_scaled"], errors="coerce").fillna(0.0)
-        df_d = df_d[df_d["w_d"] > 0].sort_values("w_d", ascending=False).head(TOP_N)
-        top_sets[d] = set(df_d["ticker"].tolist())
+        sub = panel_feat[panel_feat["date"] <= d].copy()
+        ls = build_live_signal(sub, TOP_N)
+        top_sets[d] = set(ls["ticker"].tolist()) if not ls.empty else set()
 
     cooldown_block = set()
     for i in range(1, len(recent_dates)):
@@ -680,12 +689,13 @@ def main():
     to_buy = {t for t in to_buy if t not in cooldown_block}
 
     orders = []
-
-    for _, r in today_top.iterrows():
+    for _, r in live.iterrows():
         t = r["ticker"]
+        if float(r["weight_%"]) < MIN_TRADE_PCT:
+            continue
         side = "AL" if t in to_buy else "TUT"
         orders.append({
-            "date": str(pd.to_datetime(today_date).date()),
+            "date": str(signal_date.date()),
             "side": side,
             "ticker": t,
             "target_weight_%": float(r["weight_%"]),
@@ -693,12 +703,12 @@ def main():
             "note": "T+1 açılış/ilk likit",
             "data_date": str(data_date.date()),
             "fresh": int(fresh),
-            "fresh_note": fresh_note if fresh else f"{fresh_note} → NO TRADE"
+            "fresh_note": fresh_note
         })
 
     for t in sorted(list(to_sell)):
         orders.append({
-            "date": str(pd.to_datetime(today_date).date()),
+            "date": str(signal_date.date()),
             "side": "SAT",
             "ticker": t,
             "target_weight_%": 0.0,
@@ -706,18 +716,26 @@ def main():
             "note": "Listeden çıktı → T+1 açılış/ilk likit",
             "data_date": str(data_date.date()),
             "fresh": int(fresh),
-            "fresh_note": fresh_note if fresh else f"{fresh_note} → NO TRADE"
+            "fresh_note": fresh_note
         })
 
-    orders_df = pd.DataFrame(orders).drop_duplicates(subset=["date","side","ticker"], keep="first").reset_index(drop=True)
-    orders_df.to_csv("orders_today.csv", index=False)
+    orders_df = pd.DataFrame(orders)
+    if orders_df.empty:
+        orders_df = pd.DataFrame([{
+            "date": str(signal_date.date()),
+            "side": "NONE",
+            "ticker": "NA",
+            "target_weight_%": 0.0,
+            "target_alloc_TL": 0,
+            "note": "NO TRADE",
+            "data_date": str(data_date.date()),
+            "fresh": int(fresh),
+            "fresh_note": fresh_note
+        }])
 
-    safe_print("\n✅ Files:")
-    safe_print(" - live_signal_today.csv")
-    safe_print(" - orders_today.csv")
-    safe_print(" - equity_curve_live.csv")
-    safe_print(" - report_live.csv")
-    safe_print(f"Signal date: {pd.to_datetime(today_date).date()} | Data date: {data_date.date()} | {fresh_note}")
+    orders_df.to_csv("orders_today.csv", index=False)
+    safe_print(f"✅ BIST signal date: {signal_date.date()} | data_date={data_date.date()} | {fresh_note}")
+    safe_print("✅ Files: live_signal_today.csv, orders_today.csv, equity_curve_live.csv, report_live.csv")
 
 if __name__ == "__main__":
     main()
