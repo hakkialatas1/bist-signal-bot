@@ -1,10 +1,10 @@
 # algo_step2_US_LIVE_TOP15.py
-# US TOP15 LIVE signal generator (Step-2 strengthened) + parquet cache + freshness + cooldown
-# Output:
+# US TOP15 LIVE signal generator (Step-2+) + Parquet cache + Freshness + Cooldown
+# Outputs:
 #  - orders_today_us.csv
 #  - live_signal_today_us.csv
-#  - report_live_us.csv
 #  - equity_curve_live_us.csv
+#  - report_live_us.csv
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -52,14 +52,14 @@ POS_CAP = 0.08
 GROSS_CAP = 1.00
 LAMBDA_VOL = 0.35
 
-COST_BPS = 4  # US için daha düşük varsayım
+COST_BPS = 4
 TURNOVER_CAP_DAILY = 0.40
 POS_EMA_ALPHA = 0.35
 
 VOL_TARGET_ANNUAL = 0.10
 PORT_VOL_LOOKBACK = 60
 
-USE_LIQ_FILTER = False  # US'ta kapalı (istersen açarız)
+USE_LIQ_FILTER = False
 MIN_AVG_DV20 = 20_000_000
 
 VOL_WINDOW = 252
@@ -69,29 +69,27 @@ VOL_Q_GRID = [0.55, 0.65, 0.75]
 INIT_CAPITAL_USD = 10_000
 MARKET_CANDIDATES = ["^GSPC", "SPY"]
 
-# freshness
+# Freshness
 MAX_STALENESS_DAYS = 2
-# cache
+
+# Cache
 DATA_DIR = Path("data")
 CACHE_FILE = DATA_DIR / "us_ohlcv.parquet"
 INCREMENTAL_LOOKBACK_DAYS = 10
 
-# orders
+# Orders
 MIN_TRADE_PCT = 0.20
 COOLDOWN_DAYS = 5
 
 # =========================
-# Utils
+# Helpers
 # =========================
-def today_utc_date() -> pd.Timestamp:
-    return pd.Timestamp.utcnow().normalize()
+def today_utc_naive() -> pd.Timestamp:
+    return pd.Timestamp.utcnow().tz_localize(None).normalize()
 
 def safe_print(msg: str) -> None:
     print(msg, flush=True)
 
-# =========================
-# yfinance robust download (chunk+retry)
-# =========================
 def yf_download_chunked(tickers, start, end, chunk_size=20, max_retries=6, sleep_base=2.0):
     all_raw = None
     tickers = list(tickers)
@@ -119,18 +117,17 @@ def yf_download_chunked(tickers, start, end, chunk_size=20, max_retries=6, sleep
             except Exception as e:
                 last_err = e
                 wait = sleep_base * (2 ** r)
-                safe_print(f"Download retry {r+1}/{max_retries} (chunk {i//chunk_size+1}) err={type(e).__name__} wait={wait:.1f}s")
+                safe_print(f"Download retry {r+1}/{max_retries} chunk#{i//chunk_size+1} err={type(e).__name__} wait={wait:.1f}s")
                 time.sleep(wait)
+
         if last_err is not None:
-            safe_print(f"Chunk failed permanently: {chunk[:3]}... err={last_err}")
+            safe_print(f"Chunk permanently failed: {chunk[:3]}... err={last_err}")
+
         time.sleep(0.3)
 
     return all_raw if all_raw is not None else pd.DataFrame()
 
-# =========================
-# Convert raw -> long OHLCV
-# =========================
-def _safe_normalize_long(df: pd.DataFrame, ticker: str):
+def _normalize_one(df: pd.DataFrame, ticker: str):
     if df is None or df.empty:
         return None
 
@@ -161,7 +158,7 @@ def _safe_normalize_long(df: pd.DataFrame, ticker: str):
         return None
     return out[["date","ticker","open","high","low","close","volume"]]
 
-def raw_to_long_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+def raw_to_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     frames = []
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
@@ -177,11 +174,11 @@ def raw_to_long_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
                     sub = None
             if sub is None:
                 continue
-            one = _safe_normalize_long(sub, t)
+            one = _normalize_one(sub, t)
             if one is not None:
                 frames.append(one)
     else:
-        one = _safe_normalize_long(raw.copy(), tickers[0] if tickers else "NA")
+        one = _normalize_one(raw.copy(), tickers[0] if tickers else "NA")
         if one is not None:
             frames.append(one)
 
@@ -190,28 +187,25 @@ def raw_to_long_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
 
     panel = pd.concat(frames, ignore_index=True)
     panel["date"] = pd.to_datetime(panel["date"], errors="coerce").dt.normalize()
-    return panel.sort_values(["ticker","date"]).reset_index(drop=True)
+    return panel.dropna(subset=["date","ticker","close"]).sort_values(["ticker","date"]).reset_index(drop=True)
 
-# =========================
-# Parquet cache
-# =========================
-def load_cache_parquet(path: Path) -> pd.DataFrame:
+def load_cache(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
     try:
         df = pd.read_parquet(path)
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-        df = df.dropna(subset=["date","ticker","close"]).sort_values(["ticker","date"]).reset_index(drop=True)
-        return df
+        df = df.dropna(subset=["date","ticker","close"]).drop_duplicates(subset=["date","ticker"], keep="last")
+        return df.sort_values(["ticker","date"]).reset_index(drop=True)
     except Exception:
         return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
 
-def save_cache_parquet(df: pd.DataFrame, path: Path) -> None:
+def save_cache(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
 
-def update_cache_with_yahoo(tickers: list[str], cache_path: Path, start_fallback: str, end):
-    cache = load_cache_parquet(cache_path)
+def update_cache(tickers: list[str], cache_path: Path, start_fallback: str, end):
+    cache = load_cache(cache_path)
 
     if not cache.empty:
         last_dt = pd.to_datetime(cache["date"].max()).normalize()
@@ -223,7 +217,7 @@ def update_cache_with_yahoo(tickers: list[str], cache_path: Path, start_fallback
         safe_print(f"Cache yok. Full download start={dl_start}")
 
     raw = yf_download_chunked(tickers, dl_start, end, chunk_size=20, max_retries=6)
-    new_panel = raw_to_long_panel(raw, tickers)
+    new_panel = raw_to_panel(raw, tickers)
 
     if new_panel.empty:
         if cache.empty:
@@ -235,14 +229,11 @@ def update_cache_with_yahoo(tickers: list[str], cache_path: Path, start_fallback
     merged["date"] = pd.to_datetime(merged["date"], errors="coerce").dt.normalize()
     merged = merged.dropna(subset=["date","ticker","close"]).drop_duplicates(subset=["date","ticker"], keep="last")
     merged = merged.sort_values(["ticker","date"]).reset_index(drop=True)
+    save_cache(merged, cache_path)
 
-    save_cache_parquet(merged, cache_path)
     data_date = pd.to_datetime(merged["date"].max()).normalize() if not merged.empty else None
     return merged, data_date, "✅ Yahoo güncel/cached"
 
-# =========================
-# Market proxy
-# =========================
 def load_market_series(start: str, end):
     for sym in MARKET_CANDIDATES:
         try:
@@ -362,7 +353,7 @@ FEATURES = [
 ]
 
 # =========================
-# Walk-forward + Backtest helpers
+# Walk-forward + Risk + Backtest
 # =========================
 def walk_forward_dates(dates: np.ndarray, train_days: int, test_days: int, step_days: int):
     i, n = 0, len(dates)
@@ -479,14 +470,9 @@ def max_dd(eq: pd.Series) -> float:
 # =========================
 def main():
     safe_print("1) Download (Yahoo) + Cache (Parquet)...")
-    panel, data_date, fetch_note = update_cache_with_yahoo(
-        tickers=TICKERS_ALL,
-        cache_path=CACHE_FILE,
-        start_fallback=START,
-        end=END
-    )
+    panel, data_date, fetch_note = update_cache(TICKERS_ALL, CACHE_FILE, START, END)
 
-    today = today_utc_date()
+    today = today_utc_naive()
 
     if panel is None or panel.empty or data_date is None:
         orders_df = pd.DataFrame([{
@@ -504,6 +490,11 @@ def main():
         safe_print("Panel yok → orders_today_us.csv yazıldı (kill-switch).")
         return
 
+    data_date = pd.to_datetime(data_date, errors="coerce")
+    if getattr(data_date, "tzinfo", None) is not None:
+        data_date = data_date.tz_localize(None)
+    data_date = data_date.normalize()
+
     staleness = int((today - data_date).days)
     if staleness <= MAX_STALENESS_DAYS:
         fresh = 1
@@ -518,7 +509,6 @@ def main():
 
     safe_print("2) Features...")
     panel = add_features(panel, mkt)
-
     need = ["date","ticker","ret_1","vol_20","dv20","y_fwd"] + FEATURES
     panel = panel.dropna(subset=need).copy()
     panel = panel.sort_values(["date","ticker"]).reset_index(drop=True)
@@ -581,6 +571,7 @@ def main():
         vol_q_best = best[1]
 
         model.fit(train[FEATURES], train["y_fwd"].astype(float))
+
         te_pred = test[["date","ticker","ret_1","vol_20","dv20"]].copy()
         te_pred["mu_hat"] = model.predict(test[FEATURES])
 
@@ -588,6 +579,7 @@ def main():
             pd.concat([train[["date","vol_20"]], te_pred[["date","vol_20"]]]),
             vol_q_best
         )
+
         bt, d = backtest(te_pred, thr_te, TOP_N)
         bt["fold"] = fold
         trades_chunks.append(bt)
@@ -612,7 +604,8 @@ def main():
     trades = pd.concat(trades_chunks, ignore_index=True)
 
     all_daily = pd.concat(daily_chunks)
-    all_daily = all_daily.reset_index().rename(columns={"index":"date"}) if "date" not in all_daily.columns else all_daily
+    if "date" not in all_daily.columns:
+        all_daily = all_daily.reset_index().rename(columns={"index":"date"})
     all_daily["date"] = pd.to_datetime(all_daily["date"], errors="coerce").dt.normalize()
     daily = all_daily.groupby("date")[["pnl","pnl_scaled","scale"]].mean().sort_index()
     daily["equity"] = np.exp(daily["pnl"].cumsum())
@@ -629,7 +622,7 @@ def main():
     }])
     rep.to_csv("report_live_us.csv", index=False)
 
-    last_date = trades["date"].dropna().max()
+    last_date = pd.to_datetime(trades["date"].dropna().max()).normalize()
     tdf = trades[trades["date"] == last_date].copy()
     tdf["w_final"] = pd.to_numeric(tdf["w_scaled"], errors="coerce").fillna(0.0)
     tdf = tdf[tdf["w_final"] > 0].copy().sort_values("w_final", ascending=False)
@@ -639,11 +632,11 @@ def main():
     live = tdf[["date","ticker","weight_%","alloc_USD"]].reset_index(drop=True)
     live.to_csv("live_signal_today_us.csv", index=False)
 
-    all_dates = sorted(trades["date"].dropna().unique())
+    all_dates = sorted(pd.to_datetime(trades["date"].dropna().unique()).normalize())
     prev_date = all_dates[-2] if len(all_dates) >= 2 else None
     today_date = all_dates[-1]
 
-    today_df = trades[trades["date"] == today_date].copy()
+    today_df = trades[pd.to_datetime(trades["date"]).dt.normalize() == today_date].copy()
     today_df["w_final"] = pd.to_numeric(today_df["w_scaled"], errors="coerce").fillna(0.0)
     today_df = today_df[today_df["w_final"] > 0].copy().sort_values("w_final", ascending=False)
 
@@ -654,7 +647,7 @@ def main():
     today_set = set(today_top["ticker"].tolist())
 
     if prev_date is not None:
-        prev_df = trades[trades["date"] == prev_date].copy()
+        prev_df = trades[pd.to_datetime(trades["date"]).dt.normalize() == prev_date].copy()
         prev_df["w_prev"] = pd.to_numeric(prev_df["w_scaled"], errors="coerce").fillna(0.0)
         prev_df = prev_df[prev_df["w_prev"] > 0].copy().sort_values("w_prev", ascending=False)
         prev_top = prev_df.head(TOP_N).copy()
@@ -669,15 +662,14 @@ def main():
     recent_dates = all_dates[-(COOLDOWN_DAYS + 3):]
     top_sets = {}
     for d in recent_dates:
-        df_d = trades[trades["date"] == d].copy()
+        df_d = trades[pd.to_datetime(trades["date"]).dt.normalize() == d].copy()
         df_d["w_d"] = pd.to_numeric(df_d["w_scaled"], errors="coerce").fillna(0.0)
         df_d = df_d[df_d["w_d"] > 0].sort_values("w_d", ascending=False).head(TOP_N)
         top_sets[d] = set(df_d["ticker"].tolist())
 
     cooldown_block = set()
     for i in range(1, len(recent_dates)):
-        exited = top_sets.get(recent_dates[i-1], set()) - top_sets.get(recent_dates[i], set())
-        cooldown_block |= exited
+        cooldown_block |= (top_sets.get(recent_dates[i-1], set()) - top_sets.get(recent_dates[i], set()))
     to_buy = {t for t in to_buy if t not in cooldown_block}
 
     orders = []
@@ -703,7 +695,7 @@ def main():
             "ticker": t,
             "target_weight_%": 0.0,
             "target_alloc_USD": 0,
-            "note": "Dropped from list → T+1 open/first liquid",
+            "note": "Dropped → T+1 open/first liquid",
             "data_date": str(data_date.date()),
             "fresh": int(fresh),
             "fresh_note": fresh_note if fresh else f"{fresh_note} → NO TRADE"
@@ -712,7 +704,7 @@ def main():
     orders_df = pd.DataFrame(orders).drop_duplicates(subset=["date","side","ticker"], keep="first").reset_index(drop=True)
     orders_df.to_csv("orders_today_us.csv", index=False)
 
-    safe_print("\n✅ US files:")
+    safe_print("\n✅ US Files:")
     safe_print(" - live_signal_today_us.csv")
     safe_print(" - orders_today_us.csv")
     safe_print(" - equity_curve_live_us.csv")
