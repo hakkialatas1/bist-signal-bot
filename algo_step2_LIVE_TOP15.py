@@ -19,6 +19,7 @@ from typing import Optional, List, Tuple, Iterable, Dict, Set
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from pathlib import Path
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 
@@ -72,6 +73,10 @@ VOL_MIN_PERIODS = 60
 VOL_Q_GRID = [0.55, 0.65, 0.75]
 
 INIT_CAPITAL_TL = 100_000
+DATA_DIR = Path("data")
+CACHE_FILE = DATA_DIR / "bist_ohlcv.parquet"
+INCREMENTAL_LOOKBACK_DAYS = 10  
+# son 10 günü tekrar çek (gap olmasın)
 
 # Freshness kill switch (BIST bazen 1 gün gecikmeli olabilir)
 FRESH_MAX_AGE_DAYS = 2
