@@ -508,16 +508,29 @@ def build_live_signal(panel_feat: pd.DataFrame, top_n: int) -> pd.DataFrame:
     day["vol_20"] = pd.to_numeric(day["vol_20"], errors="coerce")
     day["score"] = day["mu_hat"] - (LAMBDA_VOL * day["vol_20"].fillna(day["vol_20"].median()))
 
-    day = day.sort_values("score", ascending=False).head(top_n).copy()
+   day = day.sort_values("score", ascending=False).head(top_n).copy()
 
-    day["w_raw"] = 1.0 / max(len(day), 1)
-    day["w_raw"] = (day["w_raw"] * GROSS_CAP).clip(0.0, POS_CAP)
+# --- score -> weight (softmax) ---
+scores = day["score"].astype(float).to_numpy()
+scores = scores - np.nanmax(scores)  # stabilize
+temp = 1.0  # istersen 0.7 daha agresif yapar, 1.5 daha yumuşak
+w = np.exp(scores / temp)
+w = np.where(np.isfinite(w), w, 0.0)
 
-    day["w_final"] = day["w_raw"]
-    day["weight_%"] = (day["w_final"] * 100).round(3)
-    day["alloc_TL"] = (day["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
+if w.sum() <= 0:
+    w = np.ones_like(w)
 
-    return day[["date","ticker","w_final","weight_%","alloc_TL"]].reset_index(drop=True)
+w = w / w.sum()
+w = w * GROSS_CAP
+
+# position cap uygula, sonra tekrar normalize et
+w = np.minimum(w, POS_CAP)
+if w.sum() > 0:
+    w = (w / w.sum()) * GROSS_CAP
+
+day["w_final"] = w
+day["weight_%"] = (day["w_final"] * 100).round(3)
+day["alloc_TL"] = (day["w_final"] * INIT_CAPITAL_TL).round(0).astype(int)
 
 # =========================
 # MAIN
