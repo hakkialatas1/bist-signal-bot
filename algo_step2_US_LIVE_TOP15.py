@@ -501,7 +501,7 @@ def main():
             "fresh": int(fresh),
             "fresh_note": fresh_note
         }])
-        orders_df.to_csv("orders_us.csv", index=False)
+        orders_df.to_csv("orders_today_us.csv", index=False)
         log("Sinyal üretilemedi → orders_us.csv (NONE).")
         return
 
