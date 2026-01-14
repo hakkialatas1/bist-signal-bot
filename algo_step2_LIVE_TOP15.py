@@ -247,7 +247,120 @@ def load_market_series(start: str, end: Optional[str]) -> Optional[pd.DataFrame]
     safe_print("Market proxy yok. Fallback: universe ortalama getirisi.")
     return None
 
+def _safe_normalize_long(df: pd.DataFrame, ticker: str):
+    """tek ticker OHLCV -> long format"""
+    if df is None or df.empty:
+        return None
 
+    cols_lower = [str(c).lower() for c in df.columns]
+    idx_lower  = [str(i).lower() for i in df.index]
+    need_any = {"open","high","low","close","adj close","volume"}
+
+    if not (need_any & set(cols_lower)) and (need_any & set(idx_lower)):
+        df = df.T
+
+    df = df.rename(columns={c: str(c).lower() for c in df.columns})
+    if "close" not in df.columns and "adj close" in df.columns:
+        df["close"] = df["adj close"]
+
+    needed = ["open","high","low","close","volume"]
+    if not all(c in df.columns for c in needed):
+        return None
+
+    out = df[needed].copy()
+    out = out.reset_index().rename(columns={out.reset_index().columns[0]: "date"})
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    out["ticker"] = ticker
+    for c in needed:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.dropna(subset=["date","close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    if out.empty:
+        return None
+    return out[["date","ticker","open","high","low","close","volume"]]
+
+
+def raw_to_long_panel(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    """yfinance raw (multiindex) -> long panel"""
+    frames = []
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        for t in tickers:
+            sub = None
+            for level in [1, 0]:
+                try:
+                    sub = raw.xs(t, axis=1, level=level)
+                    break
+                except Exception:
+                    sub = None
+            if sub is None:
+                continue
+            one = _safe_normalize_long(sub, t)
+            if one is not None:
+                frames.append(one)
+    else:
+        one = _safe_normalize_long(raw.copy(), tickers[0] if tickers else "NA")
+        if one is not None:
+            frames.append(one)
+
+    if not frames:
+        return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
+
+    panel = pd.concat(frames, ignore_index=True)
+    panel["date"] = pd.to_datetime(panel["date"], errors="coerce").dt.normalize()
+    return panel.sort_values(["ticker","date"]).reset_index(drop=True)
+
+
+def load_cache_parquet(cache_path: Path) -> pd.DataFrame:
+    if not cache_path.exists():
+        return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
+    try:
+        df = pd.read_parquet(cache_path)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+        df = df.dropna(subset=["date","ticker","close"]).sort_values(["ticker","date"]).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["date","ticker","open","high","low","close","volume"])
+
+
+def save_cache_parquet(df: pd.DataFrame, cache_path: Path) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+
+
+def update_cache_with_yahoo(tickers: list[str], cache_path: Path, start_fallback: str, end, downloader_func):
+    """
+    Cache varsa: sadece son X günü + bugünü çekip birleştirir.
+    Cache yoksa: start_fallback'tan full çeker.
+    """
+    cache = load_cache_parquet(cache_path)
+
+    if not cache.empty:
+        last_dt = pd.to_datetime(cache["date"].max()).normalize()
+        dl_start = str((last_dt - pd.Timedelta(days=INCREMENTAL_LOOKBACK_DAYS)).date())
+        print(f"Cache var. Son tarih={last_dt.date()} → incremental start={dl_start}", flush=True)
+    else:
+        last_dt = None
+        dl_start = start_fallback
+        print(f"Cache yok. Full download start={dl_start}", flush=True)
+
+    raw = downloader_func(tickers, dl_start, end)
+    new_panel = raw_to_long_panel(raw, tickers)
+
+    if new_panel.empty and cache.empty:
+        return cache, None
+
+    merged = pd.concat([cache, new_panel], ignore_index=True)
+    merged["date"] = pd.to_datetime(merged["date"], errors="coerce").dt.normalize()
+    merged = merged.dropna(subset=["date","ticker","close"]).drop_duplicates(subset=["date","ticker"], keep="last")
+    merged = merged.sort_values(["ticker","date"]).reset_index(drop=True)
+
+    save_cache_parquet(merged, cache_path)
+
+    data_date = pd.to_datetime(merged["date"].max()).normalize() if not merged.empty else None
+    return merged, data_date
 # =========================
 # PANEL BUILD
 # =========================
