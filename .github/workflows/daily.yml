@@ -2,7 +2,7 @@ name: BIST + US Signal Bot
 
 on:
   schedule:
-    - cron: "10 3 * * 1-5"   # 06:10 TR (UTC=03:10)
+    - cron: "10 3 * * 1-5"   # 06:10 TR (UTC+3)
   workflow_dispatch:
 
 jobs:
@@ -30,31 +30,31 @@ jobs:
           restore-keys: |
             data-cache-
 
-      # ---------- BIST ----------
+      # ---- BIST ----
       - name: Run BIST (try 1)
         shell: bash
         run: |
           python algo_step2_LIVE_TOP15.py || true
 
-      - name: Wait 2 minutes
+      - name: Wait 120s
         run: sleep 120
 
       - name: Run BIST (try 2)
         run: python algo_step2_LIVE_TOP15.py
 
-      # ---------- US ----------
+      # ---- US ----
       - name: Run US (try 1)
         shell: bash
         run: |
           python algo_step2_US_LIVE_TOP15.py || true
 
-      - name: Wait 2 minutes
+      - name: Wait 120s
         run: sleep 120
 
       - name: Run US (try 2)
         run: python algo_step2_US_LIVE_TOP15.py
 
-      # ---------- Telegram ----------
+      # ---- Telegram ----
       - name: Send Telegram (both)
         run: python send_telegram_multi.py
         env:
